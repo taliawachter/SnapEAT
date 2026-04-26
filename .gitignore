@@ -12,6 +12,8 @@ dist
 dist-ssr
 *.local
 
+
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -28,3 +30,4 @@ node_modules/
 .env
 .DS_Store
 bot/firebase-service-account.json
+bot/auth_info/

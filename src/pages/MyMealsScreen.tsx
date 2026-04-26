@@ -68,7 +68,6 @@ export default function MyMealsScreen() {
           onClose={() => setOpenCamera(false)}
           onConfirm={(image) => {
             setCapturedImage(image);
-            setOpenCamera(false);
           }}
         />
       )}

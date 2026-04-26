@@ -3,6 +3,8 @@ import { db, bucket } from "./firebase-admin.js";
 import fs from "fs";
 import path from "path";
 import express from "express";
+import cors from "cors";
+import multer from "multer";
 import makeWASocket, {
   Browsers,
   fetchLatestBaileysVersion,
@@ -13,6 +15,7 @@ import makeWASocket, {
 import qrcode from "qrcode-terminal";
 import OpenAI from "openai";
 import { fileURLToPath } from "url";
+import { analyzeMealImage } from "./services/meal-analysis.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,6 +59,61 @@ const app = express();
 
 const uploadsDir = path.join(__dirname, "public", "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+const localUploadsRootDir = path.join(__dirname, "uploads");
+const localMealImagesDir = path.join(localUploadsRootDir, "meal-images");
+if (!fs.existsSync(localMealImagesDir)) {
+  fs.mkdirSync(localMealImagesDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, localMealImagesDir);
+  },
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname || "").toLowerCase() || ".jpg";
+    const safeExt = [".jpg", ".jpeg", ".png", ".webp"].includes(extension)
+      ? extension
+      : ".jpg";
+    cb(null, `meal-${Date.now()}-${Math.round(Math.random() * 1e9)}${safeExt}`);
+  },
+});
+
+const upload = multer({ storage });
+
+function normalizeOptionalNumber(value) {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function formatAnalysisText({ mealName, ingredients, totalCalories, protein, carbs, fat }) {
+  const ingredientLines = (ingredients || []).map((item) => {
+    const ingredientName = String(item?.name || "רכיב");
+    const ingredientCalories = Number(item?.calories || 0);
+    return `${ingredientName} | ${ingredientCalories} קל׳ | - | - | - | -`;
+  });
+
+  const lines = [
+    `זיהיתי: ${mealName}`,
+    "",
+    "רכיבים מפורטים:",
+    ...ingredientLines,
+    "",
+    "קלוריות משוערות:",
+    `הערכה סבירה: ${totalCalories}`,
+    "",
+    "מאקרו משוער:",
+  ];
+
+  if (protein !== undefined) lines.push(`חלבון: ${protein}`);
+  if (carbs !== undefined) lines.push(`פחמימות: ${carbs}`);
+  if (fat !== undefined) lines.push(`שומן: ${fat}`);
+
+  lines.push(`סה״כ: ${totalCalories} קל׳`);
+
+  return lines.join("\n");
+}
 
 function normalizeMealType(text = "") {
   const t = text.trim().toLowerCase();
@@ -177,6 +235,101 @@ async function getUserMeals(phone, limit = 5) {
 // =====================
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json());
+app.use(cors());
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+app.post("/api/meals/analyze", upload.single("mealImage"), async (req, res) => {
+  try {
+    if (!req.file) {
+      res.status(400).json({ error: "Missing meal image" });
+      return;
+    }
+
+    const imagePath = req.file.path;
+    const imageUrl = `/uploads/meal-images/${req.file.filename}`;
+    const analysis = await analyzeMealImage(imagePath);
+
+    res.json({
+      imageUrl,
+      analysis: {
+        mealName: analysis.mealName,
+        ingredients: analysis.ingredients,
+        totalCalories: analysis.totalCalories,
+        protein: analysis.protein,
+        carbs: analysis.carbs,
+        fat: analysis.fat,
+      },
+    });
+  } catch (error) {
+    console.log("❌ analyze endpoint failed:", error?.message || error);
+    res.status(500).json({ error: "Failed to analyze meal image" });
+  }
+});
+
+app.post("/api/diary/meals", async (req, res) => {
+  try {
+    const {
+      userId,
+      mealType,
+      mealName,
+      imageUrl,
+      ingredients,
+      totalCalories,
+      protein,
+      carbs,
+      fat,
+      date,
+    } = req.body || {};
+
+    if (!userId || !mealType || !mealName || !imageUrl || !Array.isArray(ingredients)) {
+      res.status(400).json({ error: "Missing required fields" });
+      return;
+    }
+
+    const validMealTypes = ["breakfast", "lunch", "dinner", "snack"];
+    if (!validMealTypes.includes(mealType)) {
+      res.status(400).json({ error: "Invalid meal type" });
+      return;
+    }
+
+    const normalizedTotalCalories = Number(totalCalories || 0);
+    const normalizedProtein = normalizeOptionalNumber(protein);
+    const normalizedCarbs = normalizeOptionalNumber(carbs);
+    const normalizedFat = normalizeOptionalNumber(fat);
+
+    const entry = {
+      mealType,
+      mealName: String(mealName),
+      imageUrl: String(imageUrl),
+      ingredients,
+      totalCalories: normalizedTotalCalories,
+      analysisText: formatAnalysisText({
+        mealName: String(mealName),
+        ingredients,
+        totalCalories: normalizedTotalCalories,
+        protein: normalizedProtein,
+        carbs: normalizedCarbs,
+        fat: normalizedFat,
+      }),
+      createdAt: date ? new Date(date) : new Date(),
+      source: "app",
+    };
+
+    if (normalizedProtein !== undefined) entry.protein = normalizedProtein;
+    if (normalizedCarbs !== undefined) entry.carbs = normalizedCarbs;
+    if (normalizedFat !== undefined) entry.fat = normalizedFat;
+
+    const savedDoc = await db.collection("users").doc(String(userId)).collection("meals").add(entry);
+
+    res.status(201).json({
+      id: savedDoc.id,
+      ok: true,
+    });
+  } catch (error) {
+    console.log("❌ diary save endpoint failed:", error?.message || error);
+    res.status(500).json({ error: "Failed to save meal in diary" });
+  }
+});
 
 app.get("/", (req, res) => {
   const htmlPath = path.join(__dirname, "public", "index.html");

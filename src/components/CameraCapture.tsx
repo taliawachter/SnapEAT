@@ -1,10 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router";
+import { analyzeMealPhoto } from "../utils/mealsApi.js";
+import type { AnalyzeMealResponse } from "../types/mealAnalysis.js";
 
 type CameraCaptureProps = {
   isOpen: boolean;
   onClose: () => void;
   onConfirm: (imageBase64: string) => void;
+  onAnalysisComplete?: (result: AnalyzeMealResponse) => void;
 };
+
+function dataUrlToFile(dataUrl: string, fileName: string) {
+  const [header, base64Data] = dataUrl.split(",");
+  if (!header || !base64Data) {
+    throw new Error("Invalid data URL");
+  }
+
+  const mimeMatch = header.match(/data:(.*?);base64/);
+  const mimeType = mimeMatch?.[1] || "image/jpeg";
+
+  const byteString = atob(base64Data);
+  const bytes = new Uint8Array(byteString.length);
+
+  for (let i = 0; i < byteString.length; i += 1) {
+    bytes[i] = byteString.charCodeAt(i);
+  }
+
+  return new File([bytes], fileName, { type: mimeType });
+}
 
 function getCameraErrorMessage(error: unknown) {
   if (!(error instanceof DOMException)) {
@@ -26,13 +49,16 @@ export default function CameraCapture({
   isOpen,
   onClose,
   onConfirm,
+  onAnalysisComplete,
 }: CameraCaptureProps) {
+  const navigate = useNavigate();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isStartingCamera, setIsStartingCamera] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -128,11 +154,33 @@ export default function CameraCapture({
     await startCamera();
   };
 
-  const handleConfirm = () => {
+  const handleConfirm = async () => {
     if (!capturedImage) return;
-    onConfirm(capturedImage);
-    stopCamera();
-    onClose();
+
+    setIsAnalyzing(true);
+    setErrorMessage(null);
+
+    try {
+      onConfirm(capturedImage);
+
+      const file = dataUrlToFile(capturedImage, `meal-${Date.now()}.jpg`);
+      const analysisResult = await analyzeMealPhoto(file);
+
+      onAnalysisComplete?.(analysisResult);
+      stopCamera();
+      onClose();
+
+      navigate("/meal-analysis-result", {
+        state: {
+          analysisResult,
+        },
+      });
+    } catch (error) {
+      console.error("Failed to analyze meal image:", error);
+      setErrorMessage("ניתוח הארוחה נכשל. נסי שוב.");
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   const handleClose = () => {
@@ -188,7 +236,7 @@ export default function CameraCapture({
             <button
               type="button"
               onClick={handleCapture}
-              disabled={Boolean(errorMessage) || isStartingCamera}
+              disabled={Boolean(errorMessage) || isStartingCamera || isAnalyzing}
               className="min-w-24 rounded-full bg-orange px-5 py-2 text-base font-bold text-white shadow-md transition hover:bg-orange/90 disabled:cursor-not-allowed disabled:opacity-60"
             >
               צלם
@@ -198,6 +246,7 @@ export default function CameraCapture({
               <button
                 type="button"
                 onClick={handleRetake}
+                disabled={isAnalyzing}
                 className="min-w-24 rounded-full bg-white/15 px-5 py-2 text-base font-bold text-white transition hover:bg-white/25"
               >
                 צלם שוב
@@ -205,9 +254,10 @@ export default function CameraCapture({
               <button
                 type="button"
                 onClick={handleConfirm}
-                className="min-w-24 rounded-full bg-orange px-5 py-2 text-base font-bold text-white shadow-md transition hover:bg-orange/90"
+                disabled={isAnalyzing}
+                className="min-w-24 rounded-full bg-orange px-5 py-2 text-base font-bold text-white shadow-md transition hover:bg-orange/90 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                אישור
+                {isAnalyzing ? "מנתחת..." : "אישור"}
               </button>
             </>
           )}
