@@ -87,11 +87,45 @@ function normalizeOptionalNumber(value) {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function normalizeIngredientForStorage(item = {}) {
+  const name = String(item?.name || item?.foodName || item?.ingredientName || "רכיב");
+
+  const quantityRaw =
+    item?.quantity ??
+    item?.amount ??
+    (item?.grams !== null && item?.grams !== undefined && item?.grams !== ""
+      ? `${item.grams} גרם`
+      : undefined);
+
+  const quantity = typeof quantityRaw === "string" && quantityRaw.trim()
+    ? quantityRaw.trim()
+    : "לא צוין";
+
+  const calories = Number(item?.calories ?? item?.kcal ?? 0);
+  const protein = Number(item?.protein ?? 0);
+  const carbs = Number(item?.carbs ?? item?.carbohydrates ?? 0);
+  const fat = Number(item?.fat ?? item?.fats ?? 0);
+
+  return {
+    name,
+    quantity,
+    calories: Number.isFinite(calories) ? calories : 0,
+    protein: Number.isFinite(protein) ? protein : 0,
+    carbs: Number.isFinite(carbs) ? carbs : 0,
+    fat: Number.isFinite(fat) ? fat : 0,
+  };
+}
+
 function formatAnalysisText({ mealName, ingredients, totalCalories, protein, carbs, fat }) {
   const ingredientLines = (ingredients || []).map((item) => {
     const ingredientName = String(item?.name || "רכיב");
+    const quantity = String(item?.quantity || "לא צוין");
     const ingredientCalories = Number(item?.calories || 0);
-    return `${ingredientName} | ${ingredientCalories} קל׳ | - | - | - | -`;
+    const ingredientCarbs = Number(item?.carbs || 0);
+    const ingredientFat = Number(item?.fat || 0);
+    const ingredientProtein = Number(item?.protein || 0);
+
+    return `${ingredientName} | כמות: ${quantity} | פחמימות: ${ingredientCarbs} גרם | שומנים: ${ingredientFat} גרם | חלבונים: ${ingredientProtein} גרם | קלוריות: ${ingredientCalories} קל׳`;
   });
 
   const lines = [
@@ -298,32 +332,62 @@ app.post("/api/diary/meals", async (req, res) => {
       return;
     }
 
+    const normalizedIngredients = ingredients.map((item) => normalizeIngredientForStorage(item));
+
     const normalizedTotalCalories = Number(totalCalories || 0);
     const normalizedProtein = normalizeOptionalNumber(protein);
     const normalizedCarbs = normalizeOptionalNumber(carbs);
     const normalizedFat = normalizeOptionalNumber(fat);
 
+    const computedTotals = normalizedIngredients.reduce(
+      (acc, item) => {
+        acc.calories += Number(item.calories || 0);
+        acc.protein += Number(item.protein || 0);
+        acc.carbs += Number(item.carbs || 0);
+        acc.fat += Number(item.fat || 0);
+        return acc;
+      },
+      { calories: 0, protein: 0, carbs: 0, fat: 0 }
+    );
+
+    const finalCalories =
+      Number.isFinite(normalizedTotalCalories) && normalizedTotalCalories > 0
+        ? normalizedTotalCalories
+        : computedTotals.calories;
+
+    const finalProtein = normalizedProtein ?? computedTotals.protein;
+    const finalCarbs = normalizedCarbs ?? computedTotals.carbs;
+    const finalFat = normalizedFat ?? computedTotals.fat;
+
     const entry = {
       mealType,
       mealName: String(mealName),
       imageUrl: String(imageUrl),
-      ingredients,
-      totalCalories: normalizedTotalCalories,
+      ingredients: normalizedIngredients,
+      totalCalories: finalCalories,
+      analysis: {
+        mealName: String(mealName),
+        ingredients: normalizedIngredients,
+        totalCalories: finalCalories,
+        protein: finalProtein,
+        carbs: finalCarbs,
+        fat: finalFat,
+      },
       analysisText: formatAnalysisText({
         mealName: String(mealName),
-        ingredients,
-        totalCalories: normalizedTotalCalories,
-        protein: normalizedProtein,
-        carbs: normalizedCarbs,
-        fat: normalizedFat,
+        ingredients: normalizedIngredients,
+        totalCalories: finalCalories,
+        protein: finalProtein,
+        carbs: finalCarbs,
+        fat: finalFat,
       }),
       createdAt: date ? new Date(date) : new Date(),
       source: "app",
     };
 
-    if (normalizedProtein !== undefined) entry.protein = normalizedProtein;
-    if (normalizedCarbs !== undefined) entry.carbs = normalizedCarbs;
-    if (normalizedFat !== undefined) entry.fat = normalizedFat;
+    if (finalProtein !== undefined) entry.protein = finalProtein;
+    if (finalCarbs !== undefined) entry.carbs = finalCarbs;
+    if (finalFat !== undefined) entry.fat = finalFat;
 
     const savedDoc = await db.collection("users").doc(String(userId)).collection("meals").add(entry);
 

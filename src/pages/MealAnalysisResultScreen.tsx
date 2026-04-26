@@ -17,6 +17,39 @@ const mealTypeOptions: { value: MealType; label: string }[] = [
   { value: "snack", label: "ארוחת ביניים" },
 ];
 
+const valueOrMissing = (value: unknown) => value ?? "לא זמין";
+
+function normalizeNumber(value: unknown) {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function getIngredientField(ingredient: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = ingredient[key];
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function formatQuantity(value: unknown) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const numeric = normalizeNumber(value);
+  if (numeric !== undefined) return `${numeric} גרם`;
+  return "לא זמין";
+}
+
+function formatMacro(value: unknown) {
+  const numeric = normalizeNumber(value);
+  return numeric !== undefined ? `${numeric} גרם` : "לא זמין";
+}
+
+function formatCalories(value: unknown) {
+  const numeric = normalizeNumber(value);
+  return numeric !== undefined ? `${numeric} קל׳` : "לא זמין";
+}
+
 export default function MealAnalysisResultScreen() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -141,17 +174,44 @@ export default function MealAnalysisResultScreen() {
             <div className="space-y-4 px-5 py-5">
               <div>
                 <h3 className="mb-2 text-lg font-bold text-dark">רכיבים שזוהו</h3>
-                <ul className="space-y-2">
-                  {analysisResult.analysis.ingredients.map((ingredient) => (
-                    <li
-                      key={`${ingredient.name}-${ingredient.calories}`}
-                      className="flex items-center justify-between rounded-xl bg-borange px-3 py-2 text-base text-dark"
-                    >
-                      <span>{ingredient.name}</span>
-                      <span className="font-semibold">{ingredient.calories} קל׳</span>
-                    </li>
-                  ))}
-                </ul>
+                <div className="space-y-4">
+                  {analysisResult.analysis.ingredients.map((ingredient, index) => {
+                    const ingredientData = ingredient as Record<string, unknown>;
+
+                    const name = valueOrMissing(
+                      getIngredientField(ingredientData, ["name", "foodName", "ingredientName"]) ?? "מרכיב"
+                    );
+                    const quantity = formatQuantity(
+                      getIngredientField(ingredientData, ["quantity", "amount", "grams"])
+                    );
+                    const calories = formatCalories(
+                      getIngredientField(ingredientData, ["calories", "kcal"])
+                    );
+                    const protein = formatMacro(
+                      getIngredientField(ingredientData, ["protein"])
+                    );
+                    const carbs = formatMacro(
+                      getIngredientField(ingredientData, ["carbs", "carbohydrates"])
+                    );
+                    const fat = formatMacro(
+                      getIngredientField(ingredientData, ["fat", "fats"])
+                    );
+
+                    return (
+                      <div
+                        key={`${String(name)}-${index}`}
+                        className="rounded-2xl border border-orange-200 bg-white/90 p-4 text-right shadow-sm"
+                      >
+                        <h3 className="text-xl font-bold text-gray-800">{String(name)}</h3>
+                        <p className="mt-2 text-base text-gray-600">כמות: {quantity}</p>
+                        <p className="mt-2 text-base leading-7 text-gray-700">
+                          פחמימות: {carbs} | שומנים: {fat} | חלבונים: {protein}
+                        </p>
+                        <p className="mt-3 text-lg font-bold text-orange-500">קלוריות: {calories}</p>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
 
               <div className="rounded-xl bg-[#F5EEE4] px-4 py-3 text-base text-dark">

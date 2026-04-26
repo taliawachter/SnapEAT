@@ -260,7 +260,7 @@ export default function CameraCapture({
                 disabled={isAnalyzing}
                 className="min-w-24 rounded-full bg-orange px-5 py-2 text-base font-bold text-white shadow-md transition hover:bg-orange/90 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {isAnalyzing ? "מנתחת..." : "אישור"}
+                {isAnalyzing ? "מנתח..." : "אישור"}
               </button>
             </>
           )}

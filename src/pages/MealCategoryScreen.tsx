@@ -6,13 +6,29 @@ import type { FirebaseError } from "firebase/app";
 import { ChevronRight, Heart, Pencil } from "lucide-react";
 import { auth, db } from "../firebase.js";
 
+const DEBUG_MEAL_ANALYSIS = import.meta.env.VITE_DEBUG_MEAL_ANALYSIS === "true";
+
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 
 type MealEntry = {
   id: string;
   mealType?: MealType;
   mealNote?: string;
+  mealName?: string;
+  totalCalories?: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
   analysisText?: string;
+  ingredients?: Array<Record<string, unknown>>;
+  analysis?: {
+    mealName?: string;
+    totalCalories?: number;
+    protein?: number;
+    carbs?: number;
+    fat?: number;
+    ingredients?: Array<Record<string, unknown>>;
+  };
   createdAt?: any;
   imageUrl?: string | null;
 };
@@ -146,7 +162,7 @@ function MealCardShell({
                   key={`${title}-${index}`}
                   className="border-b border-brown pb-4 last:border-b-0 last:pb-0"
                 >
-                  <p className="text-right text-2xl font-semibold text-dark">{line}</p>
+<p className="whitespace-pre-line text-right text-xl font-semibold leading-9 text-dark"> {line}</p>
                 </div>
               ))}
             </div>
@@ -189,7 +205,7 @@ function isSameDay(dateValue: any, compareDate: Date) {
   );
 }
 
-function extractEstimatedCalories(text = "") {
+function extractEstimatedCaloriesFromText(text = "") {
   const patterns = [
     /הערכה סבירה:\s*(\d+)/,
     /סה"כ:\s*(\d+)\s*קל/i,
@@ -207,7 +223,72 @@ function extractEstimatedCalories(text = "") {
   return 0;
 }
 
+function normalizeNumber(value: unknown) {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeText(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function valueOrMissing(value: unknown) {
+  return value ?? "לא זמין";
+}
+
+function getIngredientField(ingredient: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = ingredient[key];
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function getStructuredIngredients(meal: MealEntry) {
+  if (Array.isArray(meal.analysis?.ingredients) && meal.analysis.ingredients.length > 0) {
+    return meal.analysis.ingredients;
+  }
+
+  if (Array.isArray(meal.ingredients) && meal.ingredients.length > 0) {
+    return meal.ingredients;
+  }
+
+  return [];
+}
+
+function formatQuantity(value: unknown) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const numeric = normalizeNumber(value);
+  if (numeric !== undefined) return `${numeric} גרם`;
+  return "לא זמין";
+}
+
+function formatMacro(value: unknown) {
+  const numeric = normalizeNumber(value);
+  return numeric !== undefined ? `${numeric} גרם` : "לא זמין";
+}
+
+function formatCalories(value: unknown) {
+  const numeric = normalizeNumber(value);
+  return numeric !== undefined ? `${numeric} קל׳` : "לא זמין";
+}
+
+function extractEstimatedCalories(meal: MealEntry) {
+  const structuredCalories =
+    normalizeNumber(meal.analysis?.totalCalories) ?? normalizeNumber(meal.totalCalories);
+
+  if (structuredCalories !== undefined) return structuredCalories;
+
+  return extractEstimatedCaloriesFromText(meal.analysisText || "");
+}
+
 function extractMealTitle(meal: MealEntry, fallbackLabel: string) {
+  const structuredMealName = normalizeText(meal.analysis?.mealName) ?? normalizeText(meal.mealName);
+  if (structuredMealName) return structuredMealName;
+
   const foodLines = extractFoodLines(meal.analysisText || "");
   const firstFoodLine = foodLines.at(0);
   if (firstFoodLine) return firstFoodLine;
@@ -309,19 +390,37 @@ function extractDetailedIngredientLines(text = "") {
 
   return sectionLines.filter(Boolean);
 }
-
-function extractDetailsLines(text = "") {
+function extractDetailsLinesFromText(text = "") {
   const detailedIngredients = extractDetailedIngredientLines(text);
+
   if (detailedIngredients.length > 0) {
-    return detailedIngredients.flatMap((line) => {
+    return detailedIngredients.map((line) => {
       const parts = line
         .split("|")
         .map((part) => part.trim())
         .filter(Boolean);
 
-      if (parts.length <= 1) return [line];
+      if (parts.length <= 1) return line;
 
-      return parts;
+      const name = parts[0] ?? "מרכיב";
+      const quantity =
+        parts.find((p) => p.includes("כמות")) ?? "כמות: לא זמין";
+      const carbs =
+        parts.find((p) => p.includes("פחמימות")) ?? "פחמימות: לא זמין";
+      const fat =
+        parts.find((p) => p.includes("שומן") || p.includes("שומנים")) ??
+        "שומנים: לא זמין";
+      const protein =
+        parts.find((p) => p.includes("חלבון") || p.includes("חלבונים")) ??
+        "חלבונים: לא זמין";
+      const calories =
+        parts.find((p) => p.includes("קלוריות") || p.includes("קל׳")) ??
+        "קלוריות: לא זמין";
+
+      return `${name}
+${quantity}
+${carbs} | ${fat} | ${protein}
+${calories}`;
     });
   }
 
@@ -330,6 +429,36 @@ function extractDetailsLines(text = "") {
   const nutrition = extractNutritionLines(text);
 
   return [...ingredients, ...nutrition];
+}
+
+function extractDetailsLines(meal: MealEntry) {
+  const structuredIngredients = getStructuredIngredients(meal);
+
+  if (structuredIngredients.length > 0) {
+    return structuredIngredients.map((ingredient) => {
+      const name = valueOrMissing(
+        getIngredientField(ingredient, ["name", "foodName", "ingredientName"])
+      );
+      const quantity = formatQuantity(
+        getIngredientField(ingredient, ["quantity", "amount", "grams"])
+      );
+      const carbs = formatMacro(
+        getIngredientField(ingredient, ["carbs", "carbohydrates"])
+      );
+      const fat = formatMacro(getIngredientField(ingredient, ["fat", "fats"]));
+      const protein = formatMacro(getIngredientField(ingredient, ["protein"]));
+      const calories = formatCalories(
+        getIngredientField(ingredient, ["calories", "kcal"])
+      );
+
+      return `שם המאכל: ${String(name)}
+כמות: ${quantity}
+פחמימות: ${carbs} | שומנים: ${fat} | חלבונים: ${protein}
+קלוריות: ${calories}`;
+    });
+  }
+
+  return extractDetailsLinesFromText(meal.analysisText || "");
 }
 
 function formatDisplayDate(date: Date) {
@@ -401,6 +530,10 @@ export default function MealCategoryScreen() {
         ...doc.data(),
       })) as MealEntry[];
 
+      if (DEBUG_MEAL_ANALYSIS && data.length > 0) {
+        console.log("[meal-analysis] loaded firestore meal", data[0]);
+      }
+
       setMealsPermissionDenied(false);
       setEntries(data);
     } catch (error) {
@@ -451,7 +584,7 @@ export default function MealCategoryScreen() {
 
   const totalCalories = useMemo(() => {
     return filteredMeals.reduce(
-      (sum, meal) => sum + extractEstimatedCalories(meal.analysisText || ""),
+      (sum, meal) => sum + extractEstimatedCalories(meal),
       0
     );
   }, [filteredMeals]);
@@ -499,8 +632,8 @@ export default function MealCategoryScreen() {
             <div className="space-y-8">
               {filteredMeals.map((meal) => {
                 const title = extractMealTitle(meal, mealLabels[mealType]);
-                const calories = extractEstimatedCalories(meal.analysisText || "");
-                const detailsLines = extractDetailsLines(meal.analysisText || "");
+                const calories = extractEstimatedCalories(meal);
+                const detailsLines = extractDetailsLines(meal);
 
                 return (
                   <div key={meal.id} className="overflow-hidden rounded-2xl">

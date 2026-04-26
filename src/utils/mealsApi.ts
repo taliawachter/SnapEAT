@@ -5,15 +5,52 @@ import type {
 } from "../types/mealAnalysis.js";
 
 const API_BASE_URL = String(import.meta.env.VITE_API_BASE_URL || "http://localhost:3000");
+const DEBUG_MEAL_ANALYSIS = import.meta.env.VITE_DEBUG_MEAL_ANALYSIS === "true";
+
+function toOptionalNumber(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function toQuantityText(item: any): string | undefined {
+  if (typeof item?.quantity === "string" && item.quantity.trim()) {
+    return item.quantity.trim();
+  }
+
+  if (typeof item?.amount === "string" && item.amount.trim()) {
+    return item.amount.trim();
+  }
+
+  const grams = toOptionalNumber(item?.grams);
+  if (grams !== undefined) {
+    return `${grams} גרם`;
+  }
+
+  return undefined;
+}
 
 function normalizeIngredient(item: any): IngredientAnalysis {
+  const calories =
+    toOptionalNumber(item?.calories) ??
+    toOptionalNumber(item?.kcal) ??
+    0;
+
+  const protein = toOptionalNumber(item?.protein);
+  const carbs =
+    toOptionalNumber(item?.carbs) ??
+    toOptionalNumber(item?.carbohydrates);
+  const fat =
+    toOptionalNumber(item?.fat) ??
+    toOptionalNumber(item?.fats);
+
   return {
-    name: String(item?.name || "רכיב לא ידוע"),
-    calories: Number(item?.calories || 0),
-    ...(item?.quantity != null ? { quantity: String(item.quantity) } : {}),
-    ...(item?.protein != null ? { protein: Number(item.protein) } : {}),
-    ...(item?.carbs != null ? { carbs: Number(item.carbs) } : {}),
-    ...(item?.fat != null ? { fat: Number(item.fat) } : {}),
+    name: String(item?.name || item?.foodName || item?.ingredientName || "רכיב לא ידוע"),
+    calories,
+    ...(toQuantityText(item) ? { quantity: String(toQuantityText(item)) } : {}),
+    ...(protein != null ? { protein } : {}),
+    ...(carbs != null ? { carbs } : {}),
+    ...(fat != null ? { fat } : {}),
   };
 }
 
@@ -33,6 +70,10 @@ export async function analyzeMealPhoto(file: File): Promise<AnalyzeMealResponse>
 
   const payload = await response.json();
 
+  if (DEBUG_MEAL_ANALYSIS) {
+    console.log("[meal-analysis] analyze response payload", payload);
+  }
+
   return {
     imageUrl: String(payload?.imageUrl || ""),
     analysis: {
@@ -41,15 +82,27 @@ export async function analyzeMealPhoto(file: File): Promise<AnalyzeMealResponse>
         ? payload.analysis.ingredients.map((item: any) => normalizeIngredient(item))
         : [],
       totalCalories: Number(payload?.analysis?.totalCalories || 0),
-      protein: payload?.analysis?.protein != null ? Number(payload.analysis.protein) : undefined,
-      carbs: payload?.analysis?.carbs != null ? Number(payload.analysis.carbs) : undefined,
-      fat: payload?.analysis?.fat != null ? Number(payload.analysis.fat) : undefined,
-      confidence: payload?.analysis?.confidence != null ? Number(payload.analysis.confidence) : undefined,
+      ...(payload?.analysis?.protein != null
+        ? { protein: Number(payload.analysis.protein) }
+        : {}),
+      ...(payload?.analysis?.carbs != null
+        ? { carbs: Number(payload.analysis.carbs) }
+        : {}),
+      ...(payload?.analysis?.fat != null
+        ? { fat: Number(payload.analysis.fat) }
+        : {}),
+      ...(payload?.analysis?.confidence != null
+        ? { confidence: Number(payload.analysis.confidence) }
+        : {}),
     },
   };
 }
 
 export async function saveAnalyzedMealToDiary(payload: SaveDiaryMealPayload) {
+  if (DEBUG_MEAL_ANALYSIS) {
+    console.log("[meal-analysis] save payload", payload);
+  }
+
   const response = await fetch(`${API_BASE_URL}/api/diary/meals`, {
     method: "POST",
     headers: {

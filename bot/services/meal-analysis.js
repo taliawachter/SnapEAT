@@ -3,6 +3,7 @@ import path from "path";
 import OpenAI from "openai";
 
 let _client = null;
+const DEBUG_MEAL_ANALYSIS = process.env.DEBUG_MEAL_ANALYSIS === "true";
 
 function getClient() {
   if (!process.env.OPENAI_API_KEY) return null;
@@ -20,13 +21,28 @@ function stripJsonCodeBlock(text = "") {
 }
 
 function normalizeIngredient(item) {
+  const qty = item?.quantity ?? item?.amount;
+  const grams = item?.grams;
+
+  const quantity =
+    (typeof qty === "string" && qty.trim())
+      ? qty.trim()
+      : (grams !== null && grams !== undefined && grams !== "")
+        ? `${Number(grams) || grams} גרם`
+        : "לא צוין";
+
+  const calories = Number(item?.calories ?? item?.kcal ?? 0);
+  const protein = Number(item?.protein ?? 0);
+  const carbs = Number(item?.carbs ?? item?.carbohydrates ?? 0);
+  const fat = Number(item?.fat ?? item?.fats ?? 0);
+
   return {
-    name: String(item?.name || "רכיב"),
-    quantity: String(item?.quantity || ""),
-    calories: Number(item?.calories || 0),
-    protein: Number(item?.protein || 0),
-    carbs: Number(item?.carbs || 0),
-    fat: Number(item?.fat || 0),
+    name: String(item?.name || item?.foodName || item?.ingredientName || "רכיב"),
+    quantity,
+    calories: Number.isFinite(calories) ? calories : 0,
+    protein: Number.isFinite(protein) ? protein : 0,
+    carbs: Number.isFinite(carbs) ? carbs : 0,
+    fat: Number.isFinite(fat) ? fat : 0,
   };
 }
 
@@ -72,11 +88,15 @@ Rules:
 - confidence is a number from 0 to 1.
 - If food is unclear, set confidence to a low value (e.g. 0.3).
 - mealName and ingredient names must be in Hebrew.
-- Estimate nutrition values based on standard portions visible in the image.`;
+- Estimate nutrition values based on standard portions visible in the image.
+- For every ingredient, quantity is required and should be in grams when possible (e.g. "100 גרם").
+- For every ingredient, include calories, protein, carbs, and fat as numeric estimates even if confidence is low.
+- Never omit ingredient nutrition fields.`;
 
   const resp = await client.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.1,
+    response_format: { type: "json_object" },
     messages: [
       {
         role: "user",
@@ -89,6 +109,10 @@ Rules:
   });
 
   const raw = resp.choices?.[0]?.message?.content?.trim() || "";
+  if (DEBUG_MEAL_ANALYSIS) {
+    console.log("[meal-analysis] raw ai response", raw);
+  }
+
   const cleaned = stripJsonCodeBlock(raw);
 
   let parsed;
@@ -98,6 +122,10 @@ Rules:
     const parseErr = new Error(`AI returned invalid JSON: ${raw.slice(0, 300)}`);
     parseErr.code = "AI_PARSE_ERROR";
     throw parseErr;
+  }
+
+  if (DEBUG_MEAL_ANALYSIS) {
+    console.log("[meal-analysis] parsed ai analysis", parsed);
   }
 
   return {
