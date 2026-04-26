@@ -7,6 +7,7 @@ import SignupScreen from "./pages/SignupScreen.js";
 import PersonalDetailsScreen from "./pages/PersonalDetailsScreen.js"; 
 import NutritionJournalScreen from "./pages/NutritionJournalScreen.js";
 import MealCategoryScreen from "./pages/MealCategoryScreen.js";
+import MyMealsScreen from "./pages/MyMealsScreen.js";
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
       <Route path="/details" element={<PersonalDetailsScreen />} />
       <Route path="/home" element={<NutritionJournalScreen />} />
       <Route path="/meal/:mealType" element={<MealCategoryScreen />} />
+      <Route path="/my-meals" element={<MyMealsScreen />} />
     </Routes>
   );
 }

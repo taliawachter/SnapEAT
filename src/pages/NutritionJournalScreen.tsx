@@ -581,7 +581,6 @@ export default function NutritionJournalScreen() {
           )}
         </main>
 
-        <FloatingActionButton />
         <BottomNavbar />
       </div>
     </div>
@@ -919,23 +918,21 @@ function SimpleLineChart({
     </div>
   );
 }
-
-function FloatingActionButton() {
-  return (
-    <button
-      type="button"
-      aria-label="הוספה חדשה"
-      className="fixed bottom-24 right-5 z-20 flex h-14 w-14 items-center justify-center rounded-full bg-orange text-white shadow-[0_6px_18px_rgba(0,0,0,0.50)] transition hover:scale-105"
-    >
-      <Plus className="h-7 w-7" />
-    </button>
-  );
-}
-
 function BottomNavbar() {
+  const navigate = useNavigate();
+
   return (
-    <nav className="fixed bottom-0 left-0 right-0 z-30 mx-auto w-full max-w-[600px] border-t border-[#CFC9C1] bg-[#F3ECE4] shadow-[0_-3px_14px_rgba(0,0,0,0.08)]">
-      <div className="flex h-20 items-center justify-around px-4">
+    <nav className="fixed bottom-0 left-1/2 z-30 w-full max-w-150 -translate-x-1/2 border-t border-line bg-cream shadow-[0_-3px_14px_rgba(0,0,0,0.08)]">
+      <div className="relative flex h-20 items-center justify-around px-4">
+        <button
+          type="button"
+          aria-label="הוספה חדשה"
+          onClick={() => navigate("/my-meals")}
+          className="absolute -top-16 right-4 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-orange text-white shadow-lg hover:bg-orange/80 active:scale-95"
+        >
+          <Plus className="h-7 w-7" />
+        </button>
+
         <button
           onClick={() => openWhatsAppChat()}
           className="flex flex-col items-center gap-1 text-placeholder"
