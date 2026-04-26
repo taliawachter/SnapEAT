@@ -3,6 +3,7 @@ import { X, KeyRound, User, LogOut, CircleUserRound } from "lucide-react";
 import { signOut, updateProfile } from "firebase/auth";
 import { useNavigate } from "react-router";
 import { doc, getDoc } from "firebase/firestore/lite";
+import type { FirebaseError } from "firebase/app";
 import { auth, db } from "../firebase.js";
 
 type ProfileDrawerProps = {
@@ -23,13 +24,26 @@ export default function ProfileDrawer({
   const [profileName, setProfileName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
 
+  const resolveFallbackProfile = () => {
+    const currentUser = auth.currentUser;
+    setProfileName((userName || currentUser?.displayName || "").trim() || "משתמשת");
+    setProfileEmail(userEmail || currentUser?.email || "");
+  };
+
   useEffect(() => {
+    if (!isOpen) return;
+
     const loadProfile = async () => {
       const currentUser = auth.currentUser;
 
       if (!currentUser) {
-        setProfileName(userName || "");
-        setProfileEmail(userEmail || "");
+        resolveFallbackProfile();
+        return;
+      }
+
+      // If auth profile data already exists, avoid an unnecessary Firestore read.
+      if ((userName || currentUser.displayName) && (userEmail || currentUser.email)) {
+        resolveFallbackProfile();
         return;
       }
 
@@ -64,18 +78,19 @@ export default function ProfileDrawer({
               ""
           );
         } else {
-          setProfileName((userName || currentUser.displayName || "").trim() || "משתמשת");
-          setProfileEmail(userEmail || currentUser.email || "");
+          resolveFallbackProfile();
         }
       } catch (error) {
-        console.error("Failed to load profile:", error);
-        setProfileName((userName || currentUser.displayName || "").trim() || "משתמשת");
-        setProfileEmail(userEmail || currentUser.email || "");
+        const firebaseError = error as FirebaseError;
+        if (firebaseError?.code !== "permission-denied") {
+          console.error("Failed to load profile:", error);
+        }
+        resolveFallbackProfile();
       }
     };
 
-    loadProfile();
-  }, [userName, userEmail]);
+    void loadProfile();
+  }, [isOpen, userName, userEmail]);
 
   const handleLogout = async () => {
     try {

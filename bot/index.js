@@ -3,6 +3,8 @@ import { db, bucket } from "./firebase-admin.js";
 import fs from "fs";
 import path from "path";
 import express from "express";
+import cors from "cors";
+import multer from "multer";
 import makeWASocket, {
   Browsers,
   fetchLatestBaileysVersion,
@@ -13,6 +15,7 @@ import makeWASocket, {
 import qrcode from "qrcode-terminal";
 import OpenAI from "openai";
 import { fileURLToPath } from "url";
+import { analyzeMealImage } from "./services/meal-analysis.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,6 +59,95 @@ const app = express();
 
 const uploadsDir = path.join(__dirname, "public", "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+const localUploadsRootDir = path.join(__dirname, "uploads");
+const localMealImagesDir = path.join(localUploadsRootDir, "meal-images");
+if (!fs.existsSync(localMealImagesDir)) {
+  fs.mkdirSync(localMealImagesDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, localMealImagesDir);
+  },
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname || "").toLowerCase() || ".jpg";
+    const safeExt = [".jpg", ".jpeg", ".png", ".webp"].includes(extension)
+      ? extension
+      : ".jpg";
+    cb(null, `meal-${Date.now()}-${Math.round(Math.random() * 1e9)}${safeExt}`);
+  },
+});
+
+const upload = multer({ storage });
+
+function normalizeOptionalNumber(value) {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeIngredientForStorage(item = {}) {
+  const name = String(item?.name || item?.foodName || item?.ingredientName || "רכיב");
+
+  const quantityRaw =
+    item?.quantity ??
+    item?.amount ??
+    (item?.grams !== null && item?.grams !== undefined && item?.grams !== ""
+      ? `${item.grams} גרם`
+      : undefined);
+
+  const quantity = typeof quantityRaw === "string" && quantityRaw.trim()
+    ? quantityRaw.trim()
+    : "לא צוין";
+
+  const calories = Number(item?.calories ?? item?.kcal ?? 0);
+  const protein = Number(item?.protein ?? 0);
+  const carbs = Number(item?.carbs ?? item?.carbohydrates ?? 0);
+  const fat = Number(item?.fat ?? item?.fats ?? 0);
+
+  return {
+    name,
+    quantity,
+    calories: Number.isFinite(calories) ? calories : 0,
+    protein: Number.isFinite(protein) ? protein : 0,
+    carbs: Number.isFinite(carbs) ? carbs : 0,
+    fat: Number.isFinite(fat) ? fat : 0,
+  };
+}
+
+function formatAnalysisText({ mealName, ingredients, totalCalories, protein, carbs, fat }) {
+  const ingredientLines = (ingredients || []).map((item) => {
+    const ingredientName = String(item?.name || "רכיב");
+    const quantity = String(item?.quantity || "לא צוין");
+    const ingredientCalories = Number(item?.calories || 0);
+    const ingredientCarbs = Number(item?.carbs || 0);
+    const ingredientFat = Number(item?.fat || 0);
+    const ingredientProtein = Number(item?.protein || 0);
+
+    return `${ingredientName} | כמות: ${quantity} | פחמימות: ${ingredientCarbs} גרם | שומנים: ${ingredientFat} גרם | חלבונים: ${ingredientProtein} גרם | קלוריות: ${ingredientCalories} קל׳`;
+  });
+
+  const lines = [
+    `זיהיתי: ${mealName}`,
+    "",
+    "רכיבים מפורטים:",
+    ...ingredientLines,
+    "",
+    "קלוריות משוערות:",
+    `הערכה סבירה: ${totalCalories}`,
+    "",
+    "מאקרו משוער:",
+  ];
+
+  if (protein !== undefined) lines.push(`חלבון: ${protein}`);
+  if (carbs !== undefined) lines.push(`פחמימות: ${carbs}`);
+  if (fat !== undefined) lines.push(`שומן: ${fat}`);
+
+  lines.push(`סה״כ: ${totalCalories} קל׳`);
+
+  return lines.join("\n");
+}
 
 function normalizeMealType(text = "") {
   const t = text.trim().toLowerCase();
@@ -177,6 +269,137 @@ async function getUserMeals(phone, limit = 5) {
 // =====================
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json());
+app.use(cors());
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+app.post("/api/meals/analyze", upload.single("mealImage"), async (req, res) => {
+  try {
+    if (!req.file) {
+      res.status(400).json({ error: "Missing meal image" });
+      return;
+    }
+
+    const imagePath = req.file.path;
+    const imageUrl = `/uploads/meal-images/${req.file.filename}`;
+    const analysis = await analyzeMealImage(imagePath);
+
+    res.json({
+      imageUrl,
+      analysis: {
+        mealName: analysis.mealName,
+        ingredients: analysis.ingredients,
+        totalCalories: analysis.totalCalories,
+        protein: analysis.protein,
+        carbs: analysis.carbs,
+        fat: analysis.fat,
+        confidence: analysis.confidence,
+      },
+    });
+  } catch (error) {
+    if (error?.code === "AI_NOT_CONFIGURED") {
+      res.status(503).json({ error: "AI analysis is not configured" });
+      return;
+    }
+
+    console.log("❌ analyze endpoint failed:", error?.message || error);
+    res.status(500).json({ error: "Failed to analyze meal image" });
+  }
+});
+
+app.post("/api/diary/meals", async (req, res) => {
+  try {
+    const {
+      userId,
+      mealType,
+      mealName,
+      imageUrl,
+      ingredients,
+      totalCalories,
+      protein,
+      carbs,
+      fat,
+      date,
+    } = req.body || {};
+
+    if (!userId || !mealType || !mealName || !imageUrl || !Array.isArray(ingredients)) {
+      res.status(400).json({ error: "Missing required fields" });
+      return;
+    }
+
+    const validMealTypes = ["breakfast", "lunch", "dinner", "snack"];
+    if (!validMealTypes.includes(mealType)) {
+      res.status(400).json({ error: "Invalid meal type" });
+      return;
+    }
+
+    const normalizedIngredients = ingredients.map((item) => normalizeIngredientForStorage(item));
+
+    const normalizedTotalCalories = Number(totalCalories || 0);
+    const normalizedProtein = normalizeOptionalNumber(protein);
+    const normalizedCarbs = normalizeOptionalNumber(carbs);
+    const normalizedFat = normalizeOptionalNumber(fat);
+
+    const computedTotals = normalizedIngredients.reduce(
+      (acc, item) => {
+        acc.calories += Number(item.calories || 0);
+        acc.protein += Number(item.protein || 0);
+        acc.carbs += Number(item.carbs || 0);
+        acc.fat += Number(item.fat || 0);
+        return acc;
+      },
+      { calories: 0, protein: 0, carbs: 0, fat: 0 }
+    );
+
+    const finalCalories =
+      Number.isFinite(normalizedTotalCalories) && normalizedTotalCalories > 0
+        ? normalizedTotalCalories
+        : computedTotals.calories;
+
+    const finalProtein = normalizedProtein ?? computedTotals.protein;
+    const finalCarbs = normalizedCarbs ?? computedTotals.carbs;
+    const finalFat = normalizedFat ?? computedTotals.fat;
+
+    const entry = {
+      mealType,
+      mealName: String(mealName),
+      imageUrl: String(imageUrl),
+      ingredients: normalizedIngredients,
+      totalCalories: finalCalories,
+      analysis: {
+        mealName: String(mealName),
+        ingredients: normalizedIngredients,
+        totalCalories: finalCalories,
+        protein: finalProtein,
+        carbs: finalCarbs,
+        fat: finalFat,
+      },
+      analysisText: formatAnalysisText({
+        mealName: String(mealName),
+        ingredients: normalizedIngredients,
+        totalCalories: finalCalories,
+        protein: finalProtein,
+        carbs: finalCarbs,
+        fat: finalFat,
+      }),
+      createdAt: date ? new Date(date) : new Date(),
+      source: "app",
+    };
+
+    if (finalProtein !== undefined) entry.protein = finalProtein;
+    if (finalCarbs !== undefined) entry.carbs = finalCarbs;
+    if (finalFat !== undefined) entry.fat = finalFat;
+
+    const savedDoc = await db.collection("users").doc(String(userId)).collection("meals").add(entry);
+
+    res.status(201).json({
+      id: savedDoc.id,
+      ok: true,
+    });
+  } catch (error) {
+    console.log("❌ diary save endpoint failed:", error?.message || error);
+    res.status(500).json({ error: "Failed to save meal in diary" });
+  }
+});
 
 app.get("/", (req, res) => {
   const htmlPath = path.join(__dirname, "public", "index.html");
