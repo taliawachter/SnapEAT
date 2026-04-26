@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { useNavigate, useParams, useSearchParams } from "react-router";
 import { collection, getDocs, orderBy, query } from "firebase/firestore/lite";
 import { onAuthStateChanged } from "firebase/auth";
+import type { FirebaseError } from "firebase/app";
 import { ChevronRight, Heart, Pencil } from "lucide-react";
 import { auth, db } from "../firebase.js";
 
@@ -72,10 +73,11 @@ function MealSectionBanner({
   );
 }
 
-function AddMealButton() {
+function AddMealButton({ onClick }: { onClick: () => void }) {
   return (
     <button
       type="button"
+      onClick={onClick}
       className="mx-auto mb-8 flex h-12 min-w-60 items-center justify-center rounded-full bg-orange px-8 text-xl font-bold text-white shadow-md"
     >
       + צלם ארוחה
@@ -380,6 +382,7 @@ export default function MealCategoryScreen() {
 
   const [entries, setEntries] = useState<MealEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [mealsPermissionDenied, setMealsPermissionDenied] = useState(false);
 
   const selectedDate = useMemo(() => {
     return parseDateKey(searchParams.get("date"));
@@ -398,9 +401,15 @@ export default function MealCategoryScreen() {
         ...doc.data(),
       })) as MealEntry[];
 
+      setMealsPermissionDenied(false);
       setEntries(data);
     } catch (error) {
-      console.error("Failed to load meals:", error);
+      const firebaseError = error as FirebaseError;
+      if (firebaseError?.code === "permission-denied") {
+        setMealsPermissionDenied(true);
+      } else {
+        console.error("Failed to load meals:", error);
+      }
       setEntries([]);
     } finally {
       setLoading(false);
@@ -415,6 +424,7 @@ export default function MealCategoryScreen() {
 
       if (!user) {
         setEntries([]);
+        setMealsPermissionDenied(false);
         setLoading(false);
         return;
       }
@@ -468,8 +478,14 @@ export default function MealCategoryScreen() {
           {formatDisplayDate(selectedDate)}
         </div>
 
+        {mealsPermissionDenied && (
+          <div className="mx-4 mt-3 rounded-2xl border border-orange/30 bg-white px-4 py-3 text-center text-sm font-semibold text-orange">
+            אין הרשאה לטעון את הארוחות מהשרת כרגע. נסי להתחבר מחדש.
+          </div>
+        )}
+
         <div className="px-4 py-8">
-          <AddMealButton />
+          <AddMealButton onClick={() => navigate("/my-meals", { state: { preselectedMealType: mealType } })} />
 
           {loading ? (
             <p className="text-center text-lg text-placeholder">טוען ארוחות...</p>

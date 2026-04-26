@@ -7,6 +7,7 @@ import type { AnalyzeMealResponse, MealType } from "../types/mealAnalysis.js";
 
 type LocationState = {
   analysisResult?: AnalyzeMealResponse;
+  preselectedMealType?: MealType;
 };
 
 const mealTypeOptions: { value: MealType; label: string }[] = [
@@ -20,8 +21,9 @@ export default function MealAnalysisResultScreen() {
   const navigate = useNavigate();
   const location = useLocation();
   const state = location.state as LocationState | null;
+  const defaultMealType: MealType = state?.preselectedMealType ?? "lunch";
 
-  const [selectedMealType, setSelectedMealType] = useState<MealType>("lunch");
+  const [selectedMealType, setSelectedMealType] = useState<MealType>(defaultMealType);
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -65,7 +67,7 @@ export default function MealAnalysisResultScreen() {
         userId,
         mealType: selectedMealType,
         mealName: analysisResult.analysis.mealName,
-        imageUrl: analysisResult.imageUrl,
+        imageUrl: toAbsoluteUploadUrl(analysisResult.imageUrl),
         ingredients: analysisResult.analysis.ingredients,
         totalCalories: analysisResult.analysis.totalCalories,
         date: new Date().toISOString(),
@@ -81,6 +83,9 @@ export default function MealAnalysisResultScreen() {
       };
 
       await saveAnalyzedMealToDiary(diaryPayload);
+
+      localStorage.setItem("nutritionJournal_periodIndex", "0");
+      localStorage.setItem("nutritionJournal_activeTab", "daily");
 
       navigate("/home", { replace: true });
     } catch (error) {

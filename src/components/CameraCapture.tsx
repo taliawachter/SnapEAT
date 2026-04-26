@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { analyzeMealPhoto } from "../utils/mealsApi.js";
-import type { AnalyzeMealResponse } from "../types/mealAnalysis.js";
+import type { AnalyzeMealResponse, MealType } from "../types/mealAnalysis.js";
 
 type CameraCaptureProps = {
   isOpen: boolean;
   onClose: () => void;
   onConfirm: (imageBase64: string) => void;
   onAnalysisComplete?: (result: AnalyzeMealResponse) => void;
+  preselectedMealType?: MealType;
 };
 
 function dataUrlToFile(dataUrl: string, fileName: string) {
@@ -50,6 +51,7 @@ export default function CameraCapture({
   onClose,
   onConfirm,
   onAnalysisComplete,
+  preselectedMealType,
 }: CameraCaptureProps) {
   const navigate = useNavigate();
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -173,6 +175,7 @@ export default function CameraCapture({
       navigate("/meal-analysis-result", {
         state: {
           analysisResult,
+          preselectedMealType,
         },
       });
     } catch (error) {
