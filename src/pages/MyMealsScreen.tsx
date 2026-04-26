@@ -1,9 +1,13 @@
 import { ChevronRight } from "lucide-react";
 import { useNavigate } from "react-router";
+import { useState } from "react";
 import iphoneFrame from "../assets/iphone-frame.png";
+import CameraCapture from "../components/CameraCapture.js";
 
 export default function MyMealsScreen() {
   const navigate = useNavigate();
+  const [openCamera, setOpenCamera] = useState(false);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
 
   return (
     <div dir="rtl" className="min-h-screen bg-cream">
@@ -31,11 +35,22 @@ export default function MyMealsScreen() {
           <div className="flex justify-center">
             <button
               type="button"
+              onClick={() => setOpenCamera(true)}
               className="flex h-12 w-50 items-center justify-center rounded-full bg-orange text-xl font-bold text-white shadow-md transition hover:bg-orange/80 active:scale-95"
             >
               + צלם ארוחה
             </button>
           </div>
+
+          {capturedImage && (
+            <div className="mt-6">
+              <img
+                src={capturedImage}
+                alt="תמונה שצולמה"
+                className="mx-auto w-full max-w-sm rounded-2xl border-2 border-white/80 object-cover shadow-md"
+              />
+            </div>
+          )}
 
           <div className="mt-10">
             <img
@@ -46,6 +61,17 @@ export default function MyMealsScreen() {
           </div>
         </main>
       </div>
+
+      {openCamera && (
+        <CameraCapture
+          isOpen={openCamera}
+          onClose={() => setOpenCamera(false)}
+          onConfirm={(image) => {
+            setCapturedImage(image);
+            setOpenCamera(false);
+          }}
+        />
+      )}
     </div>
   );
 }
