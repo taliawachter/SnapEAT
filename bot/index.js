@@ -258,9 +258,15 @@ app.post("/api/meals/analyze", upload.single("mealImage"), async (req, res) => {
         protein: analysis.protein,
         carbs: analysis.carbs,
         fat: analysis.fat,
+        confidence: analysis.confidence,
       },
     });
   } catch (error) {
+    if (error?.code === "AI_NOT_CONFIGURED") {
+      res.status(503).json({ error: "AI analysis is not configured" });
+      return;
+    }
+
     console.log("❌ analyze endpoint failed:", error?.message || error);
     res.status(500).json({ error: "Failed to analyze meal image" });
   }

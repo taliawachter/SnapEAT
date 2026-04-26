@@ -10,6 +10,10 @@ function normalizeIngredient(item: any): IngredientAnalysis {
   return {
     name: String(item?.name || "רכיב לא ידוע"),
     calories: Number(item?.calories || 0),
+    ...(item?.quantity != null ? { quantity: String(item.quantity) } : {}),
+    ...(item?.protein != null ? { protein: Number(item.protein) } : {}),
+    ...(item?.carbs != null ? { carbs: Number(item.carbs) } : {}),
+    ...(item?.fat != null ? { fat: Number(item.fat) } : {}),
   };
 }
 
@@ -40,6 +44,7 @@ export async function analyzeMealPhoto(file: File): Promise<AnalyzeMealResponse>
       protein: payload?.analysis?.protein != null ? Number(payload.analysis.protein) : undefined,
       carbs: payload?.analysis?.carbs != null ? Number(payload.analysis.carbs) : undefined,
       fat: payload?.analysis?.fat != null ? Number(payload.analysis.fat) : undefined,
+      confidence: payload?.analysis?.confidence != null ? Number(payload.analysis.confidence) : undefined,
     },
   };
 }

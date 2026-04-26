@@ -3,6 +3,10 @@ export type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 export type IngredientAnalysis = {
   name: string;
   calories: number;
+  quantity?: string;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
 };
 
 export type MealAnalysis = {
@@ -12,6 +16,7 @@ export type MealAnalysis = {
   protein?: number;
   carbs?: number;
   fat?: number;
+  confidence?: number;
 };
 
 export type AnalyzeMealResponse = {

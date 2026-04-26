@@ -36,7 +36,7 @@ export default function MyMealsScreen() {
             <button
               type="button"
               onClick={() => setOpenCamera(true)}
-              className="flex h-12 w-50 items-center justify-center rounded-full bg-orange text-xl font-bold text-white shadow-md transition hover:bg-orange/80 active:scale-95"
+              className="flex h-12 min-w-60 items-center justify-center rounded-full bg-orange text-xl font-bold text-white shadow-md transition hover:bg-orange/80 active:scale-95"
             >
               + צלם ארוחה
             </button>
