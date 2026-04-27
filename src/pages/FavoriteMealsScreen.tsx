@@ -6,6 +6,7 @@ import type { FirebaseError } from "firebase/app";
 import { auth } from "../firebase.js";
 import {
   addFavoriteToDiary,
+  addFavorite,
   getFavorites,
   removeFavorite,
 } from "../utils/favoritesApi.js";
@@ -32,6 +33,15 @@ export default function FavoriteMealsScreen() {
 
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
+  const [manualName, setManualName] = useState("");
+  const [manualCalories, setManualCalories] = useState("");
+  const [manualProtein, setManualProtein] = useState("");
+  const [manualCarbs, setManualCarbs] = useState("");
+  const [manualFat, setManualFat] = useState("");
+  const [manualError, setManualError] = useState<string | null>(null);
+  const [isSavingManual, setIsSavingManual] = useState(false);
 
   const loadFavorites = useCallback(async (uid: string) => {
     setLoading(true);
@@ -88,6 +98,61 @@ export default function FavoriteMealsScreen() {
       setErrorMessage("הוספה ליומן נכשלה. נסי שוב.");
     } finally {
       setIsAdding(false);
+    }
+  };
+
+  const handleSaveManualFavorite = async () => {
+    if (!userId) return;
+
+    const normalizedName = manualName.trim();
+    const calories = Number(manualCalories);
+
+    if (!normalizedName || Number.isNaN(calories) || calories <= 0) {
+      setManualError("יש להזין שם ארוחה וקלוריות תקינות");
+      return;
+    }
+
+    const protein = manualProtein.trim() ? Number(manualProtein) : undefined;
+    const carbs = manualCarbs.trim() ? Number(manualCarbs) : undefined;
+    const fat = manualFat.trim() ? Number(manualFat) : undefined;
+
+    if (
+      (protein != null && Number.isNaN(protein)) ||
+      (carbs != null && Number.isNaN(carbs)) ||
+      (fat != null && Number.isNaN(fat))
+    ) {
+      setManualError("שדות מאקרו חייבים להיות מספריים");
+      return;
+    }
+
+    setIsSavingManual(true);
+    setManualError(null);
+
+    try {
+      await addFavorite(userId, {
+        name: normalizedName,
+        calories,
+        source: "manual",
+        ...(protein != null ? { protein } : {}),
+        ...(carbs != null ? { carbs } : {}),
+        ...(fat != null ? { fat } : {}),
+      });
+
+      await loadFavorites(userId);
+
+      setManualName("");
+      setManualCalories("");
+      setManualProtein("");
+      setManualCarbs("");
+      setManualFat("");
+      setIsManualModalOpen(false);
+      setSuccessMessage("ארוחה מועדפת נוספה בהצלחה");
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      console.error("Failed to save manual favorite:", error);
+      setManualError("שמירה נכשלה, נסי שוב");
+    } finally {
+      setIsSavingManual(false);
     }
   };
 
@@ -210,6 +275,98 @@ export default function FavoriteMealsScreen() {
                 className="flex-1 rounded-full bg-orange py-3 font-bold text-white shadow-md disabled:opacity-60"
               >
                 {isAdding ? "מוסיף..." : "הוסף"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <button
+        type="button"
+        aria-label="הוספת מועדף ידני"
+        onClick={() => {
+          setManualError(null);
+          setIsManualModalOpen(true);
+        }}
+        className="fixed bottom-6 left-1/2 z-40 flex h-14 w-14 -translate-x-1/2 items-center justify-center rounded-full bg-orange text-white shadow-lg hover:bg-orange/90 active:scale-95"
+      >
+        <Plus className="h-7 w-7" />
+      </button>
+
+      {isManualModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 px-4 pb-6"
+          onClick={() => setIsManualModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-150 rounded-3xl bg-cream p-6 shadow-2xl"
+            dir="rtl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="mb-1 text-xl font-bold text-orange">ארוחה מועדפת חדשה</h2>
+            <p className="mb-4 text-sm text-placeholder">שדות חובה: שם ארוחה, קלוריות</p>
+
+            <div className="space-y-3">
+              <input
+                type="text"
+                value={manualName}
+                onChange={(e) => setManualName(e.target.value)}
+                placeholder="שם ארוחה"
+                className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+              />
+              <input
+                type="number"
+                min="1"
+                value={manualCalories}
+                onChange={(e) => setManualCalories(e.target.value)}
+                placeholder="קלוריות"
+                className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+              />
+              <input
+                type="number"
+                min="0"
+                value={manualProtein}
+                onChange={(e) => setManualProtein(e.target.value)}
+                placeholder="חלבון (אופציונלי)"
+                className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+              />
+              <input
+                type="number"
+                min="0"
+                value={manualCarbs}
+                onChange={(e) => setManualCarbs(e.target.value)}
+                placeholder="פחמימות (אופציונלי)"
+                className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+              />
+              <input
+                type="number"
+                min="0"
+                value={manualFat}
+                onChange={(e) => setManualFat(e.target.value)}
+                placeholder="שומנים (אופציונלי)"
+                className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+              />
+            </div>
+
+            {manualError && (
+              <p className="mt-3 text-center text-sm text-red-500">{manualError}</p>
+            )}
+
+            <div className="mt-5 flex gap-3">
+              <button
+                type="button"
+                onClick={() => setIsManualModalOpen(false)}
+                className="flex-1 rounded-full border border-orange py-3 font-bold text-orange"
+              >
+                ביטול
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSaveManualFavorite()}
+                disabled={isSavingManual}
+                className="flex-1 rounded-full bg-orange py-3 font-bold text-white shadow-md disabled:opacity-60"
+              >
+                {isSavingManual ? "שומר..." : "שמירה"}
               </button>
             </div>
           </div>

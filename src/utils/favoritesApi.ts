@@ -7,6 +7,7 @@ import {
   orderBy,
   query,
   serverTimestamp,
+  where,
 } from "firebase/firestore/lite";
 import { db } from "../firebase.js";
 import type { FavoriteMeal, MealType, IngredientAnalysis } from "../types/mealAnalysis.js";
@@ -28,6 +29,31 @@ function buildAnalysisText(
   return lines.join("\n");
 }
 
+function normalizeMealName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+export async function findExistingFavoriteId(
+  userId: string,
+  mealName: string,
+  calories: number,
+): Promise<string | null> {
+  const normalizedName = normalizeMealName(mealName);
+  if (!normalizedName) return null;
+
+  const ref = collection(db, "users", userId, "favoriteMeals");
+  const q = query(ref, where("calories", "==", calories));
+  const snapshot = await getDocs(q);
+
+  const duplicateDoc = snapshot.docs.find((snap) => {
+    const data = snap.data() as { name?: unknown };
+    const candidateName = typeof data.name === "string" ? normalizeMealName(data.name) : "";
+    return candidateName === normalizedName;
+  });
+
+  return duplicateDoc?.id ?? null;
+}
+
 export async function getFavorites(userId: string): Promise<FavoriteMeal[]> {
   const ref = collection(db, "users", userId, "favoriteMeals");
   const q = query(ref, orderBy("createdAt", "desc"));
@@ -39,6 +65,9 @@ export async function addFavorite(
   userId: string,
   meal: Omit<FavoriteMeal, "id" | "createdAt" | "updatedAt">,
 ): Promise<string> {
+  const existingId = await findExistingFavoriteId(userId, meal.name, meal.calories);
+  if (existingId) return existingId;
+
   const ref = collection(db, "users", userId, "favoriteMeals");
   const docRef = await addDoc(ref, {
     ...meal,
@@ -51,6 +80,15 @@ export async function addFavorite(
 export async function removeFavorite(userId: string, favoriteId: string): Promise<void> {
   const ref = doc(db, "users", userId, "favoriteMeals", favoriteId);
   await deleteDoc(ref);
+}
+
+export async function isMealFavorited(
+  userId: string,
+  mealName: string,
+  calories: number,
+): Promise<boolean> {
+  const existingId = await findExistingFavoriteId(userId, mealName, calories);
+  return Boolean(existingId);
 }
 
 /**

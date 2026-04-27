@@ -45,6 +45,7 @@ export type FavoriteMeal = {
   carbs?: number;
   fat?: number;
   imageUrl?: string;
+  source?: "saved_from_meal" | "manual";
   ingredients?: IngredientAnalysis[];
   createdAt?: unknown;
   updatedAt?: unknown;

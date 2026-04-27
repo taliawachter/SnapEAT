@@ -1,9 +1,9 @@
 import { Heart, ChevronRight, Pencil } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { auth } from "../firebase.js";
 import { saveAnalyzedMealToDiary, toAbsoluteUploadUrl } from "../utils/mealsApi.js";
-import { addFavorite } from "../utils/favoritesApi.js";
+import { addFavorite, isMealFavorited } from "../utils/favoritesApi.js";
 import type { AnalyzeMealResponse, MealType } from "../types/mealAnalysis.js";
 
 type LocationState = {
@@ -69,6 +69,38 @@ export default function MealAnalysisResultScreen() {
     if (!analysisResult?.imageUrl) return "";
     return toAbsoluteUploadUrl(analysisResult.imageUrl);
   }, [analysisResult?.imageUrl]);
+
+  useEffect(() => {
+    const userId = auth.currentUser?.uid;
+    if (!userId || !analysisResult) {
+      setIsFavorited(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const syncFavoriteState = async () => {
+      try {
+        const exists = await isMealFavorited(
+          userId,
+          analysisResult.analysis.mealName,
+          analysisResult.analysis.totalCalories,
+        );
+        if (!cancelled) setIsFavorited(exists);
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Failed to check favorite state:", error);
+          setIsFavorited(false);
+        }
+      }
+    };
+
+    void syncFavoriteState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [analysisResult]);
 
   if (!analysisResult) {
     return (
@@ -181,6 +213,7 @@ export default function MealAnalysisResultScreen() {
                         name: analysisResult.analysis.mealName,
                         calories: analysisResult.analysis.totalCalories,
                         imageUrl: toAbsoluteUploadUrl(analysisResult.imageUrl),
+                        source: "saved_from_meal",
                         ingredients: analysisResult.analysis.ingredients,
                         ...(analysisResult.analysis.protein != null
                           ? { protein: analysisResult.analysis.protein }
