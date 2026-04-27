@@ -115,7 +115,7 @@ export default function PersonalDetailsScreen() {
       <div className="mx-auto flex min-h-screen w-full max-w-150 flex-col">
         <div className="mb-16 flex items-center justify-between border-b border-placeholder pb-3">
           <button
-            onClick={() => navigate("/signup")}
+            onClick={() => navigate(-1)}
             className="text-orange"
             aria-label="חזרה"
           >
