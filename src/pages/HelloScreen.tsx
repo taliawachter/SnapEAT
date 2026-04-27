@@ -1,11 +1,45 @@
+import { useState } from "react";
 import { FaFacebookSquare } from "react-icons/fa";
 import { SiGmail } from "react-icons/si";
 
 import { useNavigate } from "react-router";
 import foodImage from "../assets/hello-food.png";
+import {
+  signInWithSocialProvider,
+  signInWithGoogle,
+  facebookProvider,
+} from "../utils/socialAuth.js";
 
 export default function HelloScreen() {
   const navigate = useNavigate();
+  const [loadingProvider, setLoadingProvider] = useState<
+    "google" | "facebook" | null
+  >(null);
+  const [socialError, setSocialError] = useState<string | null>(null);
+
+  const handleSocialLogin = async (provider: "google" | "facebook") => {
+    if (loadingProvider) return;
+    setSocialError(null);
+    setLoadingProvider(provider);
+    try {
+      if (provider === "google") {
+        console.log("[SocialAuth] before Google login");
+        const result = await signInWithGoogle();
+        console.log("[SocialAuth] after Google login result", result);
+        const destination = result.isProfileComplete ? "/home" : "/details";
+        console.log("[SocialAuth] before navigate", destination);
+        navigate(destination);
+        return;
+      }
+
+      const result = await signInWithSocialProvider(facebookProvider);
+      navigate(result.isProfileComplete ? "/home" : "/details");
+    } catch {
+      setSocialError("ההתחברות נכשלה, נסי שוב");
+    } finally {
+      setLoadingProvider(null);
+    }
+  };
 
   return (
    
@@ -48,15 +82,33 @@ export default function HelloScreen() {
         </div>
 
         <div className="w-full max-w-150 flex flex-col gap-4">
-          <button className="flex h-14 items-center justify-center gap-3 rounded-2xl bg-facebook text-white shadow-md">
-            <span className="text-xl sm:text-xl "> התחברות עם Facebook </span>
+          <button
+            onClick={() => handleSocialLogin("facebook")}
+            disabled={!!loadingProvider}
+            className="flex h-14 items-center justify-center gap-3 rounded-2xl bg-facebook text-white shadow-md disabled:opacity-60"
+          >
+            <span className="text-xl sm:text-xl ">
+              {loadingProvider === "facebook"
+                ? "מתחבר..."
+                : " התחברות עם Facebook "}
+            </span>
             <FaFacebookSquare className="text-xl font-bold" />
           </button>
 
-          <button className="flex h-14 items-center justify-center gap-3 rounded-2xl border border-white bg-white text-black shadow-sm">
-            <span className="text-xl sm:text-xl ">התחברות עם Gmail</span>
+          <button
+            onClick={() => handleSocialLogin("google")}
+            disabled={!!loadingProvider}
+            className="flex h-14 items-center justify-center gap-3 rounded-2xl border border-white bg-white text-black shadow-sm disabled:opacity-60"
+          >
+            <span className="text-xl sm:text-xl ">
+              {loadingProvider === "google" ? "מתחבר..." : "התחברות עם Gmail"}
+            </span>
             <SiGmail className="text-xl text-red-600" />
           </button>
+
+          {socialError && (
+            <p className="text-center text-sm text-red-500">{socialError}</p>
+          )}
         </div>
     </section>
   );
