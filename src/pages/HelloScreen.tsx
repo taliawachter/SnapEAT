@@ -6,7 +6,7 @@ import { useNavigate } from "react-router";
 import foodImage from "../assets/hello-food.png";
 import {
   signInWithSocialProvider,
-  googleProvider,
+  signInWithGoogle,
   facebookProvider,
 } from "../utils/socialAuth.js";
 
@@ -22,10 +22,18 @@ export default function HelloScreen() {
     setSocialError(null);
     setLoadingProvider(provider);
     try {
-      const destination = await signInWithSocialProvider(
-        provider === "google" ? googleProvider : facebookProvider
-      );
-      navigate(destination);
+      if (provider === "google") {
+        console.log("[SocialAuth] before Google login");
+        const result = await signInWithGoogle();
+        console.log("[SocialAuth] after Google login result", result);
+        const destination = result.isProfileComplete ? "/home" : "/details";
+        console.log("[SocialAuth] before navigate", destination);
+        navigate(destination);
+        return;
+      }
+
+      const result = await signInWithSocialProvider(facebookProvider);
+      navigate(result.isProfileComplete ? "/home" : "/details");
     } catch {
       setSocialError("ההתחברות נכשלה, נסי שוב");
     } finally {

@@ -3,8 +3,18 @@ import {
   GoogleAuthProvider,
   FacebookAuthProvider,
   type AuthProvider,
+  type User,
 } from "firebase/auth";
-import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore/lite";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  serverTimestamp,
+  setDoc,
+  where,
+} from "firebase/firestore/lite";
 import { auth, db } from "../firebase.js";
 
 /** Fields that come from social providers and are always safe to overwrite. */
@@ -18,12 +28,51 @@ interface SocialUserFields {
   updatedAt: ReturnType<typeof serverTimestamp>;
 }
 
+type UserDocData = Record<string, unknown>;
+
+export type SocialSignInResult = {
+  user: User;
+  isProfileComplete: boolean;
+};
+
+const PERSONAL_DETAIL_KEYS = [
+  "gender",
+  "birthDate",
+  "height",
+  "weight",
+] as const;
+
 /**
  * Returns true when the user has completed the personal-details step.
  * Used to decide where to navigate after social sign-in.
  */
-function hasPersonalDetails(data: Record<string, unknown>): boolean {
+function hasPersonalDetails(data: UserDocData): boolean {
   return !!(data.gender && data.birthDate && data.height && data.weight);
+}
+
+function hasUsefulValue(value: unknown): boolean {
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  return value !== undefined && value !== null;
+}
+
+function getMissingPersonalDetailsPatch(
+  targetData: UserDocData | null,
+  sourceData: UserDocData
+): Partial<UserDocData> {
+  const patch: Partial<UserDocData> = {};
+
+  for (const key of PERSONAL_DETAIL_KEYS) {
+    const targetValue = targetData?.[key];
+    const sourceValue = sourceData[key];
+
+    if (!hasUsefulValue(targetValue) && hasUsefulValue(sourceValue)) {
+      patch[key] = sourceValue;
+    }
+  }
+
+  return patch;
 }
 
 /**
@@ -34,7 +83,7 @@ function hasPersonalDetails(data: Record<string, unknown>): boolean {
  */
 export async function signInWithSocialProvider(
   provider: AuthProvider
-): Promise<"/home" | "/details"> {
+): Promise<SocialSignInResult> {
   const result = await signInWithPopup(auth, provider);
   const user = result.user;
 
@@ -55,23 +104,68 @@ export async function signInWithSocialProvider(
     updatedAt: serverTimestamp(),
   };
 
-  const userRef = doc(db, "users", user.uid);
-  const userSnap = await getDoc(userRef);
+  try {
+    const userRef = doc(db, "users", user.uid);
+    const userSnap = await getDoc(userRef);
+    const currentUserData = userSnap.exists()
+      ? (userSnap.data() as UserDocData)
+      : null;
 
-  if (!userSnap.exists()) {
-    // Brand-new user — write full doc including createdAt.
-    await setDoc(userRef, {
-      ...socialFields,
-      createdAt: serverTimestamp(),
-    });
-    return "/details";
+    if (!userSnap.exists()) {
+      // Brand-new user — write full doc including createdAt.
+      await setDoc(userRef, {
+        ...socialFields,
+        createdAt: serverTimestamp(),
+      });
+    } else {
+      // Existing user — merge only the safe social fields, preserve personal details.
+      await setDoc(userRef, socialFields, { merge: true });
+    }
+
+    if (currentUserData && hasPersonalDetails(currentUserData)) {
+      return { user, isProfileComplete: true };
+    }
+
+    if (user.email) {
+      try {
+        const usersRef = collection(db, "users");
+        const sameEmailQuery = query(usersRef, where("email", "==", user.email));
+        const sameEmailSnap = await getDocs(sameEmailQuery);
+
+        const matchedProfileDoc = sameEmailSnap.docs.find((snap) => {
+          if (snap.id === user.uid) return false;
+          const data = snap.data() as UserDocData;
+          return hasPersonalDetails(data);
+        });
+
+        if (matchedProfileDoc) {
+          const matchedData = matchedProfileDoc.data() as UserDocData;
+          const profilePatch = getMissingPersonalDetailsPatch(
+            currentUserData,
+            matchedData
+          );
+
+          if (Object.keys(profilePatch).length > 0) {
+            await setDoc(userRef, profilePatch, { merge: true });
+          }
+
+          return { user, isProfileComplete: true };
+        }
+      } catch (queryError) {
+        console.error("Social auth email lookup failed:", queryError);
+      }
+    }
+
+    return { user, isProfileComplete: false };
+  } catch (profileError) {
+    console.error("Social auth profile sync failed:", profileError);
+    // Login already succeeded; default to details to avoid leaving the user stuck.
+    return { user, isProfileComplete: false };
   }
+}
 
-  // Existing user — merge only the safe social fields, preserve personal details.
-  await setDoc(userRef, socialFields, { merge: true });
-
-  const data = userSnap.data() as Record<string, unknown>;
-  return hasPersonalDetails(data) ? "/home" : "/details";
+export async function signInWithGoogle(): Promise<SocialSignInResult> {
+  return signInWithSocialProvider(googleProvider);
 }
 
 export const googleProvider = new GoogleAuthProvider();
