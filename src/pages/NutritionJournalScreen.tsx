@@ -2,24 +2,19 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import {
   Menu,
-  Plus,
-  Heart,
   Coffee,
   Hamburger,
   Salad,
   Apple,
-  CalendarDays,
   ChevronRight,
   ChevronLeft,
 } from "lucide-react";
-import { MdOutlineWhatsapp } from "react-icons/md";
-import { BsChatLeftDots } from "react-icons/bs";
 import { collection, getDocs, orderBy, query } from "firebase/firestore/lite";
 import { onAuthStateChanged } from "firebase/auth";
 import type { FirebaseError } from "firebase/app";
-import { openWhatsAppChat } from "../utils/whatsapp.js";
 import { auth, db } from "../firebase.js";
 import ProfileDrawer from "./ProfileDrawer.js";
+import BottomNavbar from "../components/BottomNavbar.js";
 
 type TabKey = "daily" | "weekly" | "monthly";
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
@@ -931,49 +926,5 @@ function SimpleLineChart({
         })}
       </svg>
     </div>
-  );
-}
-function BottomNavbar() {
-  const navigate = useNavigate();
-
-  return (
-    <nav className="fixed bottom-0 left-1/2 z-30 w-full max-w-150 -translate-x-1/2 border-t border-line bg-cream shadow-[0_-3px_14px_rgba(0,0,0,0.08)]">
-      <div className="relative flex h-20 items-center justify-around px-4">
-        <button
-          type="button"
-          aria-label="הוספה חדשה"
-          onClick={() => navigate("/my-meals")}
-          className="absolute -top-16 right-4 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-orange text-white shadow-lg hover:bg-orange/80 active:scale-95"
-        >
-          <Plus className="h-7 w-7" />
-        </button>
-
-        <button
-          onClick={() => openWhatsAppChat()}
-          className="flex flex-col items-center gap-1 text-placeholder"
-        >
-          <MdOutlineWhatsapp className="h-7 w-7" />
-          <span className="text-sm">WhatsApp</span>
-        </button>
-
-        <button
-          onClick={() => navigate("/favorites")}
-          className="flex flex-col items-center gap-1 text-placeholder"
-        >
-          <Heart className="h-7 w-7" />
-          <span className="text-sm">מועדפים</span>
-        </button>
-
-        <button className="flex flex-col items-center gap-1 text-orange">
-          <CalendarDays className="h-7 w-7" />
-          <span className="text-sm">יומן</span>
-        </button>
-
-        <button className="flex flex-col items-center gap-1 text-placeholder">
-          <BsChatLeftDots className="h-7 w-7" />
-          <span className="text-sm">הצ'אט שלי</span>
-        </button>
-      </div>
-    </nav>
   );
 }

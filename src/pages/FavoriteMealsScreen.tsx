@@ -12,6 +12,7 @@ import {
 } from "../utils/favoritesApi.js";
 import { toAbsoluteUploadUrl } from "../utils/mealsApi.js";
 import type { FavoriteMeal, MealType } from "../types/mealAnalysis.js";
+import BottomNavbar from "../components/BottomNavbar.js";
 
 const mealTypeOptions: { value: MealType; label: string }[] = [
   { value: "breakfast", label: "ארוחת בוקר" },
@@ -172,7 +173,17 @@ export default function FavoriteMealsScreen() {
 
             <h1 className="text-2xl font-bold text-orange">מועדפים</h1>
 
-            <div className="h-11 w-11" />
+            <button
+              type="button"
+              aria-label="הוספת מועדף ידני"
+              onClick={() => {
+                setManualError(null);
+                setIsManualModalOpen(true);
+              }}
+              className="flex h-11 w-11 items-center justify-center rounded-full text-orange transition hover:bg-orange/10"
+            >
+              <Plus className="h-6 w-6" />
+            </button>
           </div>
         </header>
 
@@ -218,6 +229,8 @@ export default function FavoriteMealsScreen() {
             </div>
           )}
         </main>
+
+        <BottomNavbar showAddButton={false} />
       </div>
 
       {/* Meal-type picker modal */}
@@ -280,18 +293,6 @@ export default function FavoriteMealsScreen() {
           </div>
         </div>
       )}
-
-      <button
-        type="button"
-        aria-label="הוספת מועדף ידני"
-        onClick={() => {
-          setManualError(null);
-          setIsManualModalOpen(true);
-        }}
-        className="fixed bottom-6 left-1/2 z-40 flex h-14 w-14 -translate-x-1/2 items-center justify-center rounded-full bg-orange text-white shadow-lg hover:bg-orange/90 active:scale-95"
-      >
-        <Plus className="h-7 w-7" />
-      </button>
 
       {isManualModalOpen && (
         <div
