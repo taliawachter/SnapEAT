@@ -9,6 +9,7 @@ import NutritionJournalScreen from "./pages/NutritionJournalScreen.js";
 import MealCategoryScreen from "./pages/MealCategoryScreen.js";
 import MyMealsScreen from "./pages/MyMealsScreen.js";
 import MealAnalysisResultScreen from "./pages/MealAnalysisResultScreen.js";
+import FavoriteMealsScreen from "./pages/FavoriteMealsScreen.js";
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
       <Route path="/meal/:mealType" element={<MealCategoryScreen />} />
       <Route path="/my-meals" element={<MyMealsScreen />} />
       <Route path="/meal-analysis-result" element={<MealAnalysisResultScreen />} />
+      <Route path="/favorites" element={<FavoriteMealsScreen />} />
     </Routes>
   );
 }

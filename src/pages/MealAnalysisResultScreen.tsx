@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { auth } from "../firebase.js";
 import { saveAnalyzedMealToDiary, toAbsoluteUploadUrl } from "../utils/mealsApi.js";
+import { addFavorite } from "../utils/favoritesApi.js";
 import type { AnalyzeMealResponse, MealType } from "../types/mealAnalysis.js";
 
 type LocationState = {
@@ -59,6 +60,8 @@ export default function MealAnalysisResultScreen() {
   const [selectedMealType, setSelectedMealType] = useState<MealType>(defaultMealType);
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isFavorited, setIsFavorited] = useState(false);
+  const [isSavingFavorite, setIsSavingFavorite] = useState(false);
 
   const analysisResult = state?.analysisResult;
 
@@ -165,8 +168,43 @@ export default function MealAnalysisResultScreen() {
                 <button type="button" aria-label="עריכה">
                   <Pencil className="h-7 w-7" />
                 </button>
-                <button type="button" aria-label="מועדפים">
-                  <Heart className="h-7 w-7" />
+                <button
+                  type="button"
+                  aria-label="מועדפים"
+                  disabled={isSavingFavorite}
+                  onClick={async () => {
+                    const userId = auth.currentUser?.uid;
+                    if (!userId || isFavorited || isSavingFavorite) return;
+                    setIsSavingFavorite(true);
+                    try {
+                      await addFavorite(userId, {
+                        name: analysisResult.analysis.mealName,
+                        calories: analysisResult.analysis.totalCalories,
+                        imageUrl: toAbsoluteUploadUrl(analysisResult.imageUrl),
+                        ingredients: analysisResult.analysis.ingredients,
+                        ...(analysisResult.analysis.protein != null
+                          ? { protein: analysisResult.analysis.protein }
+                          : {}),
+                        ...(analysisResult.analysis.carbs != null
+                          ? { carbs: analysisResult.analysis.carbs }
+                          : {}),
+                        ...(analysisResult.analysis.fat != null
+                          ? { fat: analysisResult.analysis.fat }
+                          : {}),
+                      });
+                      setIsFavorited(true);
+                    } catch (err) {
+                      console.error("Failed to save favorite:", err);
+                    } finally {
+                      setIsSavingFavorite(false);
+                    }
+                  }}
+                >
+                  <Heart
+                    className={`h-7 w-7 transition ${
+                      isFavorited ? "fill-orange text-orange" : ""
+                    }`}
+                  />
                 </button>
               </div>
             </div>

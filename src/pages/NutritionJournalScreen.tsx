@@ -956,7 +956,10 @@ function BottomNavbar() {
           <span className="text-sm">WhatsApp</span>
         </button>
 
-        <button className="flex flex-col items-center gap-1 text-placeholder">
+        <button
+          onClick={() => navigate("/favorites")}
+          className="flex flex-col items-center gap-1 text-placeholder"
+        >
           <Heart className="h-7 w-7" />
           <span className="text-sm">מועדפים</span>
         </button>
