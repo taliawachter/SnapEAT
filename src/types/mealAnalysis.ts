@@ -36,3 +36,17 @@ export type SaveDiaryMealPayload = {
   fat?: number;
   date: string;
 };
+
+export type FavoriteMeal = {
+  id: string;
+  name: string;
+  calories: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
+  imageUrl?: string;
+  source?: "saved_from_meal" | "manual";
+  ingredients?: IngredientAnalysis[];
+  createdAt?: unknown;
+  updatedAt?: unknown;
+};

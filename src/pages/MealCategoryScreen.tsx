@@ -5,6 +5,7 @@ import { onAuthStateChanged } from "firebase/auth";
 import type { FirebaseError } from "firebase/app";
 import { ChevronRight, Heart, Pencil } from "lucide-react";
 import { auth, db } from "../firebase.js";
+import { addFavorite, isMealFavorited } from "../utils/favoritesApi.js";
 
 const DEBUG_MEAL_ANALYSIS = import.meta.env.VITE_DEBUG_MEAL_ANALYSIS === "true";
 
@@ -131,11 +132,17 @@ function MealCardShell({
   title,
   calories,
   details,
+  isFavorited,
+  isSavingFavorite,
+  onFavoriteClick,
   expanded = false,
 }: {
   title: string;
   calories: number;
   details: string[];
+  isFavorited: boolean;
+  isSavingFavorite: boolean;
+  onFavoriteClick: () => void;
   expanded?: boolean;
 }) {
   return (
@@ -146,8 +153,17 @@ function MealCardShell({
           <button type="button" aria-label="עריכה">
             <Pencil className="h-8 w-8" />
           </button>
-          <button type="button" aria-label="מועדפים">
-            <Heart className="h-8 w-8 fill-orange text-orange" />
+          <button
+            type="button"
+            aria-label="מועדפים"
+            disabled={isSavingFavorite}
+            onClick={onFavoriteClick}
+          >
+            <Heart
+              className={`h-8 w-8 transition ${
+                isFavorited ? "fill-orange text-orange" : ""
+              }`}
+            />
           </button>
         </div>
 
@@ -512,6 +528,8 @@ export default function MealCategoryScreen() {
   const [entries, setEntries] = useState<MealEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [mealsPermissionDenied, setMealsPermissionDenied] = useState(false);
+  const [favoriteStateByMealId, setFavoriteStateByMealId] = useState<Record<string, boolean>>({});
+  const [savingFavoriteIds, setSavingFavoriteIds] = useState<Record<string, boolean>>({});
 
   const selectedDate = useMemo(() => {
     return parseDateKey(searchParams.get("date"));
@@ -582,6 +600,45 @@ export default function MealCategoryScreen() {
     );
   }, [entries, mealType, selectedDate]);
 
+  useEffect(() => {
+    const userId = auth.currentUser?.uid;
+    if (!userId || filteredMeals.length === 0) {
+      setFavoriteStateByMealId({});
+      return;
+    }
+
+    let cancelled = false;
+
+    const syncFavoriteState = async () => {
+      const checks = await Promise.all(
+        filteredMeals.map(async (meal) => {
+          const title = extractMealTitle(meal, mealLabels[mealType]);
+          const calories = extractEstimatedCalories(meal);
+          try {
+            const isFav = await isMealFavorited(userId, title, calories);
+            return { id: meal.id, isFav };
+          } catch {
+            return { id: meal.id, isFav: false };
+          }
+        })
+      );
+
+      if (cancelled) return;
+
+      const nextState: Record<string, boolean> = {};
+      checks.forEach((item) => {
+        nextState[item.id] = item.isFav;
+      });
+      setFavoriteStateByMealId(nextState);
+    };
+
+    void syncFavoriteState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [filteredMeals, mealType]);
+
   const totalCalories = useMemo(() => {
     return filteredMeals.reduce(
       (sum, meal) => sum + extractEstimatedCalories(meal),
@@ -634,6 +691,8 @@ export default function MealCategoryScreen() {
                 const title = extractMealTitle(meal, mealLabels[mealType]);
                 const calories = extractEstimatedCalories(meal);
                 const detailsLines = extractDetailsLines(meal);
+                const isFavorited = favoriteStateByMealId[meal.id] ?? false;
+                const isSavingFavorite = savingFavoriteIds[meal.id] ?? false;
 
                 return (
                   <div key={meal.id} className="overflow-hidden rounded-2xl">
@@ -646,6 +705,41 @@ export default function MealCategoryScreen() {
                       title={title}
                       calories={calories}
                       details={detailsLines}
+                      isFavorited={isFavorited}
+                      isSavingFavorite={isSavingFavorite}
+                      onFavoriteClick={() => {
+                        const userId = auth.currentUser?.uid;
+                        if (!userId || isFavorited || isSavingFavorite) return;
+
+                        setSavingFavoriteIds((prev) => ({ ...prev, [meal.id]: true }));
+
+                        void (async () => {
+                          try {
+                            const protein = normalizeNumber(meal.analysis?.protein) ?? normalizeNumber(meal.protein);
+                            const carbs = normalizeNumber(meal.analysis?.carbs) ?? normalizeNumber(meal.carbs);
+                            const fat = normalizeNumber(meal.analysis?.fat) ?? normalizeNumber(meal.fat);
+
+                            await addFavorite(userId, {
+                              name: title,
+                              calories,
+                              imageUrl: meal.imageUrl ?? undefined,
+                              source: "saved_from_meal",
+                              ...(protein != null ? { protein } : {}),
+                              ...(carbs != null ? { carbs } : {}),
+                              ...(fat != null ? { fat } : {}),
+                            });
+
+                            setFavoriteStateByMealId((prev) => ({
+                              ...prev,
+                              [meal.id]: true,
+                            }));
+                          } catch (error) {
+                            console.error("Failed to save favorite:", error);
+                          } finally {
+                            setSavingFavoriteIds((prev) => ({ ...prev, [meal.id]: false }));
+                          }
+                        })();
+                      }}
                       expanded
                     />
                   </div>
