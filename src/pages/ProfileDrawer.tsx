@@ -147,11 +147,6 @@ export default function ProfileDrawer({
 
         <div className="px-6 pt-8">
           <div className="flex items-center justify-between border-b border-bbrown py-5 text-dark">
-            <KeyRound className="h-6 w-6" />
-            <span className="text-s font-semibold">שינוי סיסמא</span>
-          </div>
-
-          <div className="flex items-center justify-between border-b border-bbrown py-5 text-dark">
             <User className="h-6 w-6" />
             <span className="text-s font-semibold">נתונים אישיים</span>
           </div>

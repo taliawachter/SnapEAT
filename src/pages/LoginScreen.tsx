@@ -141,12 +141,6 @@ export default function LoginScreen() {
             התחברות
           </button>
 
-          <button
-            onClick={() => navigate("/forgot-password")}
-            className="mt-6 text-xl font-bold text-orange"
-          >
-            שכחתי סיסמה?
-          </button>
         </div>
       </div>
     </section>
