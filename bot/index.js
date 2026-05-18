@@ -453,42 +453,29 @@ function isGreeting(text) {
 }
 
 function shouldIgnoreMessage(msg, type) {
-  if (type !== "notify") return true;
-  if (!msg || !msg.message) return true;
+  if (!msg) return true;
+
+  // ignore messages sent by the bot itself
   if (msg.key?.fromMe) return true;
 
-  const from = msg.key?.remoteJid || "";
-  if (!from) return true;
+  const jid = msg.key?.remoteJid || "";
 
-  if (from === "status@broadcast") return true;
-  if (!from.endsWith("@s.whatsapp.net")) return true;
+  // ignore broadcasts/status
+  if (jid === "status@broadcast") return true;
+  if (jid.endsWith("@broadcast")) return true;
 
-  const rawMessage = msg.message;
-  const m =
-    rawMessage?.ephemeralMessage?.message ||
-    rawMessage?.viewOnceMessage?.message ||
-    rawMessage;
+  // ignore protocol/system messages
+  if (msg.message?.protocolMessage) return true;
+  if (msg.message?.senderKeyDistributionMessage) return true;
 
-  if (m?.protocolMessage) return true;
-  if (msg.messageStubType) return true;
+  // ignore empty messages
+  if (!msg.message) return true;
 
-  if (
-    rawMessage?.historySyncNotification ||
-    m?.historySyncNotification ||
-    rawMessage?.senderKeyDistributionMessage ||
-    m?.senderKeyDistributionMessage
-  ) {
+  // IMPORTANT:
+  // allow BOTH notify and append
+  if (type !== "notify" && type !== "append") {
     return true;
   }
-
-  const hasImage = !!m?.imageMessage;
-  const hasText = !!(
-    m?.conversation ||
-    m?.extendedTextMessage?.text ||
-    m?.imageMessage?.caption
-  );
-
-  if (!hasImage && !hasText) return true;
 
   return false;
 }
@@ -728,6 +715,21 @@ let sock = null;
 let isStarting = false;
 let reconnectTimer = null;
 
+/**
+ * Cleanup corrupted auth_info directory
+ */
+function cleanAuthDirectory() {
+  const authDir = path.join(__dirname, "auth_info");
+  if (fs.existsSync(authDir)) {
+    try {
+      fs.rmSync(authDir, { recursive: true, force: true });
+      console.log("🧹 Cleaned up auth_info directory");
+    } catch (err) {
+      console.log("⚠️ Failed to clean auth_info:", err?.message);
+    }
+  }
+}
+
 async function startBot() {
   if (isStarting) return;
   isStarting = true;
@@ -735,28 +737,37 @@ async function startBot() {
   try {
     if (!process.env.OPENAI_API_KEY) {
       console.log("❌ חסר OPENAI_API_KEY בקובץ .env");
+      isStarting = false;
       return;
     }
 
     if (!process.env.FIREBASE_STORAGE_BUCKET) {
       console.log("❌ חסר FIREBASE_STORAGE_BUCKET בקובץ .env");
+      isStarting = false;
       return;
     }
+
+    // Close existing socket properly
+    if (sock?.ws) {
+      try {
+        sock.ws.close();
+        sock = null;
+      } catch (err) {
+        console.log("⚠️ Error closing existing socket:", err?.message);
+      }
+    }
+
+    // Cleanup timer
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    console.log("🔄 Initializing WhatsApp Bot...");
 
     const authDir = path.join(__dirname, "auth_info");
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
-
-    const pairingPhone = normalizePhone(process.env.PAIRING_PHONE || "");
-    const usePairingCode =
-      (process.env.USE_PAIRING_CODE || "false").toLowerCase() === "true";
-    const shouldPair = !state.creds.registered;
-
-    if (sock?.ws) {
-      try {
-        sock.ws.close();
-      } catch {}
-    }
 
     sock = makeWASocket({
       auth: state,
@@ -767,70 +778,74 @@ async function startBot() {
       syncFullHistory: false,
     });
 
+    console.log("📝 Setting up event listeners...");
+
+    // Save credentials whenever updated
     sock.ev.on("creds.update", saveCreds);
 
-    if (shouldPair && usePairingCode && !pairingPhone) {
-      console.log("❌ חסר PAIRING_PHONE בקובץ .env");
-      console.log("הוסיפי למשל: PAIRING_PHONE=9725XXXXXXXX");
-    }
-
-    if (shouldPair && !usePairingCode) {
-      console.log("ℹ️ מצב QR פעיל.");
-      console.log("סרקי את ה-QR דרך WhatsApp > Linked Devices");
-    }
-
-    let qrShown = false;
-    let pairingRequested = false;
-
+    // Handle QR code generation and connection state
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      const reason = lastDisconnect?.error?.output?.statusCode;
 
-      if (shouldPair && qr && !usePairingCode && !qrShown) {
-        qrShown = true;
-        console.log("📱 QR מוכן לסריקה:");
+      console.log(`📡 Connection state: ${connection}`);
+
+      // Display QR code if available
+      if (qr) {
+        console.log("\n📱 QR CODE - Scan with WhatsApp:");
+        console.log("Go to WhatsApp > Settings > Linked Devices > Link a Device\n");
         qrcode.generate(qr, { small: true });
       }
 
-      if (
-        shouldPair &&
-        connection === "connecting" &&
-        usePairingCode &&
-        pairingPhone &&
-        !pairingRequested
-      ) {
-        pairingRequested = true;
-        try {
-          const code = await sock.requestPairingCode(pairingPhone);
-          console.log("🔑 Pairing code:", code);
-          console.log("פתחי וואטסאפ > Linked Devices > Link with phone number");
-        } catch (err) {
-          console.log("❌ שגיאה בקבלת pairing code:", err?.message || err);
-          pairingRequested = false;
-        }
-      }
-
+      // Handle successful connection
       if (connection === "open") {
-        console.log("✅ מחובר ל-WhatsApp!");
-        qrShown = false;
-        pairingRequested = false;
-
+        console.log("✅ Successfully connected to WhatsApp!");
+        isStarting = false;
+        
+        // Clear reconnection timer
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
           reconnectTimer = null;
         }
       }
 
+      // Handle disconnection with specific error codes
       if (connection === "close") {
-        console.log("❌ החיבור נסגר. קוד:", reason);
+        const reason = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message || "Unknown error";
+        
+        console.log(`\n❌ Connection closed - Code: ${reason} - ${errorMessage}`);
 
-        if (reason === DisconnectReason.loggedOut || reason === 401) {
-          console.log("נדרש חיבור מחדש. מחקי auth_info ונסי שוב.");
+        // 401 Unauthorized - session expired or logged out
+        if (reason === 401 || reason === DisconnectReason.loggedOut) {
+          console.log("🔐 Re-authentication required (401 Unauthorized)");
+          console.log("🧹 Cleaning up corrupted session...");
+          cleanAuthDirectory();
+          console.log("↻ Restart the bot to scan new QR code");
+          isStarting = false;
           return;
         }
 
-        if (reason === DisconnectReason.restartRequired || reason === 515) {
-          console.log("🔄 restart required, מתחבר מחדש בעוד 2 שניות...");
+        // 403 Forbidden - generally means connection replaced
+        if (reason === 403) {
+          console.log("⚠️ Session replaced (403)");
+          console.log("This may happen if you connected on another device");
+          cleanAuthDirectory();
+          isStarting = false;
+          return;
+        }
+
+        // 405 Not Allowed - typically device pairing issue
+        if (reason === 405) {
+          console.log("⚠️ Device pairing issue (405)");
+          cleanAuthDirectory();
+          isStarting = false;
+          return;
+        }
+
+        // 515 Restart Required
+        if (reason === 515 || reason === DisconnectReason.restartRequired) {
+          console.log("🔄 Restart required (515) - reconnecting in 2 seconds...");
+          isStarting = false;
           if (!reconnectTimer) {
             reconnectTimer = setTimeout(() => {
               reconnectTimer = null;
@@ -840,12 +855,23 @@ async function startBot() {
           return;
         }
 
-        if (reason === 405) {
-          console.log("405 בדרך כלל אומר בעיית pairing/session. מחקי auth_info ונסי שוב.");
+        // Handle connection conflicts from group chats
+        if (reason === 440) {
+          console.log("⚠️ Connection conflict (440) - likely group message issue");
+          console.log("🔄 Attempting to reconnect in 3 seconds...");
+          isStarting = false;
+          if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              startBot();
+            }, 3000);
+          }
           return;
         }
 
-        console.log("החיבור נסגר. מנסה שוב בעוד 3 שניות...");
+        // Generic reconnection for other errors
+        console.log("🔄 Reconnecting in 3 seconds...");
+        isStarting = false;
         if (!reconnectTimer) {
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
@@ -858,8 +884,13 @@ async function startBot() {
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
       const msg = messages?.[0];
 
+      if (!msg) {
+        console.log("⏭️ messages.upsert received with no message");
+        return;
+      }
+
       if (shouldIgnoreMessage(msg, type)) {
-        console.log("⏭️ מדלג על הודעת sync/system/not-relevant");
+        console.log("⏭️ Ignoring non-user or system message, type:", type);
         return;
       }
 
@@ -867,12 +898,12 @@ async function startBot() {
       const fromNumber = normalizePhone(from);
 
       if (fromNumber === BOT_NUMBER) {
-        console.log("⛔ הודעה מהבוט עצמו - מדלג");
+        console.log("⛔ Ignoring bot's own message");
         return;
       }
 
       if (ALLOWED_NUMBERS.size && !ALLOWED_NUMBERS.has(fromNumber)) {
-        console.log("⛔ נחסם - לא המספר המורשה:", fromNumber);
+        console.log("⛔ Blocked incoming message from:", fromNumber);
         return;
       }
 
@@ -889,10 +920,13 @@ async function startBot() {
         imageMessage?.caption ||
         "";
 
-      console.log("📨 from:", fromNumber);
-      console.log("📨 text:", text);
+      console.log("📨 Incoming message from:", from);
+      console.log("📨 Sender normalized:", fromNumber);
+      console.log("📨 Message type:", type);
+      console.log("📨 Text:", text || "[no text]");
 
       try {
+
         if (imageMessage) {
           await sock.sendMessage(from, {
             text: "מנתחת את התמונה עכשיו, רגע 🙏",
@@ -1035,9 +1069,18 @@ ${clarificationQuestion}`,
       }
     });
   } catch (err) {
-    console.log("❌ startBot error:", err?.message || err);
-  } finally {
+    console.log("❌ ❌ Fatal error initializing bot:", err?.message || err);
+    console.log("Stack trace:", err?.stack);
     isStarting = false;
+    
+    // Retry after delay
+    console.log("🔄 Retrying in 5 seconds...");
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        startBot();
+      }, 5000);
+    }
   }
 }
 
