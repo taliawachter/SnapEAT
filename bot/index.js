@@ -52,6 +52,132 @@ const ALLOWED_NUMBERS = new Set(
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+let memoryServiceModule = null;
+let didTryLoadMemoryService = false;
+
+async function getMemoryService() {
+  if (didTryLoadMemoryService) return memoryServiceModule;
+  didTryLoadMemoryService = true;
+
+  try {
+    memoryServiceModule = await import("./services/memory.service.js");
+  } catch (error) {
+    memoryServiceModule = null;
+    console.log("⚠️ Memory service unavailable:", error?.message || error);
+  }
+
+  return memoryServiceModule;
+}
+
+function parseAssistantJson(rawContent = "") {
+  const text = String(rawContent || "").trim();
+  if (!text) return null;
+
+  const cleaned = text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+
+    if (start === -1 || end === -1 || end <= start) return null;
+
+    try {
+      return JSON.parse(cleaned.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+  }
+}
+
+const LONG_TERM_MEMORY_FIELDS = [
+  "height",
+  "weight",
+  "goalWeight",
+  "activityLevel",
+  "dietPreferences",
+  "allergies",
+  "likedFoods",
+  "dislikedFoods",
+  "notes",
+];
+
+function sanitizeMemoryUpdate(memoryUpdate) {
+  if (!memoryUpdate || typeof memoryUpdate !== "object" || Array.isArray(memoryUpdate)) {
+    return null;
+  }
+
+  const filtered = {};
+
+  for (const field of LONG_TERM_MEMORY_FIELDS) {
+    const value = memoryUpdate[field];
+    if (value === undefined) continue;
+
+    if (field === "dietPreferences" || field === "allergies" || field === "likedFoods" || field === "dislikedFoods") {
+      if (Array.isArray(value)) {
+        filtered[field] = value
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 50);
+      }
+      continue;
+    }
+
+    if (field === "height" || field === "weight" || field === "goalWeight") {
+      const num = Number(value);
+      if (Number.isFinite(num)) filtered[field] = num;
+      continue;
+    }
+
+    const asString = String(value || "").trim();
+    if (asString) filtered[field] = asString;
+  }
+
+  return Object.keys(filtered).length ? filtered : null;
+}
+
+function formatRecentMessagesForPrompt(messages = []) {
+  if (!Array.isArray(messages) || !messages.length) return "אין היסטוריית שיחה קודמת.";
+
+  return messages
+    .map((msg, index) => {
+      const role = String(msg?.role || "user");
+      const content = String(msg?.content || "");
+      return `${index + 1}. ${role}: ${content}`;
+    })
+    .join("\n");
+}
+
+function formatUserMemoryForPrompt(userMemory) {
+  if (!userMemory?.profile) return "אין זיכרון משתמש ארוך-טווח.";
+
+  try {
+    return JSON.stringify(userMemory.profile, null, 2);
+  } catch {
+    return "אין זיכרון משתמש ארוך-טווח.";
+  }
+}
+
+function resolveSenderJid(msg) {
+  const key = msg?.key || {};
+  const remoteJid = String(key.remoteJid || "");
+  const participant = String(key.participant || "");
+  const participantAlt = String(
+    key.participantAlt || key.participantPn || key.participantLid || msg?.participantAlt || ""
+  );
+
+  if (remoteJid.endsWith("@lid")) {
+    if (participantAlt) return participantAlt;
+    if (participant) return participant;
+  }
+
+  return remoteJid;
+}
+
 // =====================
 // Storage
 // =====================
@@ -455,24 +581,24 @@ function isGreeting(text) {
 function shouldIgnoreMessage(msg, type) {
   if (!msg) return true;
 
-  // ignore messages sent by the bot itself
+  // Ignore messages sent by the bot itself
   if (msg.key?.fromMe) return true;
 
   const jid = msg.key?.remoteJid || "";
 
-  // ignore broadcasts/status
+  // Ignore broadcasts and status updates
   if (jid === "status@broadcast") return true;
   if (jid.endsWith("@broadcast")) return true;
 
-  // ignore protocol/system messages
+  // Ignore protocol/system messages
   if (msg.message?.protocolMessage) return true;
   if (msg.message?.senderKeyDistributionMessage) return true;
 
-  // ignore empty messages
+  // Ignore if no message object at all
   if (!msg.message) return true;
 
-  // IMPORTANT:
-  // allow BOTH notify and append
+  // Accept both "notify" (new messages) and "append" (message updates/continuations)
+  // Reject only truly system message types
   if (type !== "notify" && type !== "append") {
     return true;
   }
@@ -559,12 +685,33 @@ function cleanAnalysisText(text = "") {
 // OpenAI helpers
 // =====================
 async function generateReply(chatId, userText) {
-  if (isGreeting(userText)) {
-    return "היי אהובה 😊 אני יכולה לעזור לך עם הערכת קלוריות, חלבון וניתוח ארוחות. תשלחי לי תמונת אוכל או שאלה על מה שאכלת.";
-  }
-
   const phone = normalizePhone(chatId);
   const recentMeals = await getUserMeals(phone, 5);
+  const memoryService = await getMemoryService();
+
+  let recentMessages = [];
+  let userMemory = null;
+  let latestSummary = null;
+
+  if (memoryService) {
+    try {
+      recentMessages = await memoryService.getRecentMessages(phone, 10);
+    } catch (error) {
+      console.log("⚠️ getRecentMessages failed:", error?.message || error);
+    }
+
+    try {
+      userMemory = await memoryService.getUserMemory(phone);
+    } catch (error) {
+      console.log("⚠️ getUserMemory failed:", error?.message || error);
+    }
+
+    try {
+      latestSummary = await memoryService.getLatestSummary(phone);
+    } catch (error) {
+      console.log("⚠️ getLatestSummary failed:", error?.message || error);
+    }
+  }
 
   const mealsSummary = recentMeals.length
     ? recentMeals
@@ -578,6 +725,10 @@ async function generateReply(chatId, userText) {
         .join("\n\n")
     : "אין היסטוריית ארוחות קודמת.";
 
+  const latestSummaryText = latestSummary?.summary
+    ? String(latestSummary.summary)
+    : "אין סיכום שיחה זמין.";
+
   const messages = [
     {
       role: "system",
@@ -590,14 +741,45 @@ async function generateReply(chatId, userText) {
 - אם זו הודעה כללית, עדיין תעני בטבעיות ובנעימות.
 - תני תשובות פרקטיות וקצרות יחסית.
 - אם חסר מידע, שאלי שאלה אחת קצרה.
-- השתמשי בהיסטוריית הארוחות אם זה עוזר לתת תשובה אישית יותר.
+- השתמשי בהיסטוריית הארוחות והזיכרון אם זה עוזר לתת תשובה אישית יותר.
 - אל תתני ייעוץ רפואי.
+
+החזירי תמיד ורק JSON תקין במבנה הבא:
+{
+  "reply": "string",
+  "shouldSaveMemory": boolean,
+  "memoryUpdate": {
+    "height": 0,
+    "weight": 0,
+    "goalWeight": 0,
+    "activityLevel": "",
+    "dietPreferences": [],
+    "allergies": [],
+    "likedFoods": [],
+    "dislikedFoods": [],
+    "notes": ""
+  }
+}
+
+כללים לשמירת זיכרון:
+- shouldSaveMemory=true רק אם המשתמש/ת נתן/ה מידע יציב וארוך-טווח.
+- לשמור רק שדות מתוך: height, weight, goalWeight, activityLevel, dietPreferences, allergies, likedFoods, dislikedFoods, notes.
+- לא לשמור מידע זמני, חד-פעמי, רעב רגעי, ארוחה של היום, מצב רוח רגעי.
+- אם אין עדכון זיכרון: shouldSaveMemory=false ו-memoryUpdate={}. 
+
+היסטוריית שיחה אחרונה:
+${formatRecentMessagesForPrompt(recentMessages)}
+
+זיכרון משתמש ארוך-טווח:
+${formatUserMemoryForPrompt(userMemory)}
+
+סיכום שיחה אחרון:
+${latestSummaryText}
 
 היסטוריית ארוחות אחרונה:
 ${mealsSummary}
 `.trim(),
     },
-    ...getHistory(chatId),
     { role: "user", content: userText },
   ];
 
@@ -607,10 +789,28 @@ ${mealsSummary}
     temperature: 0.6,
   });
 
-  return (
-    resp.choices?.[0]?.message?.content?.trim() ||
-    "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏"
-  );
+  const rawContent = resp.choices?.[0]?.message?.content?.trim() || "";
+  const parsed = parseAssistantJson(rawContent);
+
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      reply:
+        rawContent ||
+        "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
+      shouldSaveMemory: false,
+      memoryUpdate: null,
+    };
+  }
+
+  const reply = String(parsed.reply || "").trim();
+  const memoryUpdate = sanitizeMemoryUpdate(parsed.memoryUpdate || {});
+  const shouldSaveMemory = Boolean(parsed.shouldSaveMemory) && Boolean(memoryUpdate);
+
+  return {
+    reply: reply || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
+    shouldSaveMemory,
+    memoryUpdate,
+  };
 }
 
 async function estimateCaloriesFromImage(imageDataUrl, userNote = "") {
@@ -890,7 +1090,7 @@ async function startBot() {
       }
 
       if (shouldIgnoreMessage(msg, type)) {
-        console.log("⏭️ Ignoring non-user or system message, type:", type);
+        console.log("⏭️  Skip: System/non-user message (type: %s)", type);
         return;
       }
 
@@ -898,12 +1098,12 @@ async function startBot() {
       const fromNumber = normalizePhone(from);
 
       if (fromNumber === BOT_NUMBER) {
-        console.log("⛔ Ignoring bot's own message");
+        console.log("⏭️  Skip: Bot's own message");
         return;
       }
 
       if (ALLOWED_NUMBERS.size && !ALLOWED_NUMBERS.has(fromNumber)) {
-        console.log("⛔ Blocked incoming message from:", fromNumber);
+        console.log("⏭️  Skip: Not in allowlist (%s)", fromNumber);
         return;
       }
 
@@ -920,10 +1120,7 @@ async function startBot() {
         imageMessage?.caption ||
         "";
 
-      console.log("📨 Incoming message from:", from);
-      console.log("📨 Sender normalized:", fromNumber);
-      console.log("📨 Message type:", type);
-      console.log("📨 Text:", text || "[no text]");
+      console.log("✅ Accepted: type=%s text=%s", type, text ? `"${text.substring(0, 40)}..."` : "[no text]");
 
       try {
 
@@ -1045,10 +1242,45 @@ ${clarificationQuestion}`,
 
           addToHistory(from, "user", cleanText);
 
-          const reply = await generateReply(from, cleanText);
+          const phone = normalizePhone(from);
+          const memoryService = await getMemoryService();
+
+          // Save user message to Firestore
+          if (memoryService) {
+            try {
+              await memoryService.saveMessage(phone, "user", cleanText);
+              console.log("💾 Firestore: Saved user message");
+            } catch (error) {
+              console.log("⚠️  Firestore error (save user): %s", error?.message || error);
+            }
+          }
+
+          const replyData = await generateReply(from, cleanText);
+          const reply = replyData?.reply || replyData;
+
           await sock.sendMessage(from, { text: reply });
 
           addToHistory(from, "assistant", reply);
+
+          // Save assistant message and update memory if needed
+          if (memoryService) {
+            try {
+              await memoryService.saveMessage(phone, "assistant", reply);
+              console.log("💾 Firestore: Saved assistant message");
+            } catch (error) {
+              console.log("⚠️  Firestore error (save assistant): %s", error?.message || error);
+            }
+
+            if (replyData?.shouldSaveMemory && replyData?.memoryUpdate) {
+              try {
+                await memoryService.upsertUserMemory(phone, replyData.memoryUpdate);
+                console.log("💾 Firestore: Updated user memory");
+              } catch (error) {
+                console.log("⚠️  Firestore error (update memory): %s", error?.message || error);
+              }
+            }
+          }
+
           return;
         }
 
