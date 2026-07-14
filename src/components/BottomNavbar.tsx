@@ -38,6 +38,13 @@ export default function BottomNavbar({ onPlusClick, showAddButton = true }: Bott
           <span className="text-sm">WhatsApp</span>
         </button>
 
+<button
+          onClick={() => navigate("/home")}
+          className={`flex flex-col items-center gap-1 ${isJournalActive ? "text-orange" : "text-placeholder"}`}>
+          <CalendarDays className="h-7 w-7" />
+          <span className="text-sm">יומן</span>
+        </button>
+        
         <button
           onClick={() => navigate("/favorites")}
           className={`flex flex-col items-center gap-1 ${isFavoritesActive ? "text-orange" : "text-placeholder"}`}
@@ -46,18 +53,7 @@ export default function BottomNavbar({ onPlusClick, showAddButton = true }: Bott
           <span className="text-sm">מועדפים</span>
         </button>
 
-        <button
-          onClick={() => navigate("/home")}
-          className={`flex flex-col items-center gap-1 ${isJournalActive ? "text-orange" : "text-placeholder"}`}
-        >
-          <CalendarDays className="h-7 w-7" />
-          <span className="text-sm">יומן</span>
-        </button>
-
-        <button className="flex flex-col items-center gap-1 text-placeholder">
-          <BsChatLeftDots className="h-7 w-7" />
-          <span className="text-sm">הצ'אט שלי</span>
-        </button>
+        
       </div>
     </nav>
   );

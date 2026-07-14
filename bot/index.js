@@ -178,6 +178,51 @@ function resolveSenderJid(msg) {
   return remoteJid;
 }
 
+function isPnJid(jid = "") {
+  return String(jid).endsWith("@s.whatsapp.net");
+}
+
+function isLidJid(jid = "") {
+  return String(jid).endsWith("@lid") || String(jid).endsWith("@hosted.lid");
+}
+
+async function resolvePhoneFromMessageKey(msg, socket) {
+  const key = msg?.key || {};
+  const remoteJid = String(key.remoteJid || "");
+  const remoteJidAlt = String(key.remoteJidAlt || "");
+  const participant = String(key.participant || "");
+  const participantAlt = String(key.participantAlt || "");
+
+  const pnCandidate =
+    (isPnJid(remoteJidAlt) && remoteJidAlt) ||
+    (isPnJid(participantAlt) && participantAlt) ||
+    (isPnJid(remoteJid) && remoteJid) ||
+    (isPnJid(participant) && participant) ||
+    "";
+
+  if (pnCandidate) {
+    return normalizePhone(pnCandidate);
+  }
+
+  const lidCandidates = [remoteJidAlt, participantAlt, remoteJid, participant].filter(isLidJid);
+  const lidMapping = socket?.signalRepository?.lidMapping;
+
+  if (lidMapping && lidCandidates.length) {
+    for (const lidJid of lidCandidates) {
+      try {
+        const mappedPnJid = await lidMapping.getPNForLID(lidJid);
+        if (isPnJid(mappedPnJid)) {
+          return normalizePhone(mappedPnJid);
+        }
+      } catch (error) {
+        console.log("⚠️ LID mapping lookup failed:", error?.message || error);
+      }
+    }
+  }
+
+  return "";
+}
+
 // =====================
 // Storage
 // =====================
@@ -288,6 +333,11 @@ function normalizeMealType(text = "") {
 
 async function uploadMealImage(buffer, mimeType, phone) {
   const normalizedPhone = normalizePhone(phone);
+
+  if (!normalizedPhone) {
+    throw new Error("Missing resolved phone for upload");
+  }
+
   const extension = mimeType?.includes("png") ? "png" : "jpg";
   const fileName = `meal-images/${normalizedPhone}/${Date.now()}.${extension}`;
   const file = bucket.file(fileName);
@@ -325,19 +375,18 @@ async function getUserByPhone(phone) {
     ...snapshot.docs[0].data(),
   };
 }
-
 async function saveMealEntry({
-  from,
+  phone,
   mealNote = "",
   analysisText = "",
   imageUrl = null,
   mealType = "",
 }) {
-  const phone = normalizePhone(from);
-  const user = await getUserByPhone(phone);
+  const normalizedPhone = normalizePhone(phone);
+  const user = await getUserByPhone(normalizedPhone);
 
   if (!user) {
-    console.log("❌ לא נמצא משתמש:", phone);
+    console.log("❌ משתמש לא נמצא:", normalizedPhone);
     return false;
   }
 
@@ -546,6 +595,74 @@ app.listen(PORT, () => {
 // =====================
 const memory = new Map();
 const pending = new Map();
+const processedMessageIds = new Map();
+
+const MESSAGE_ID_TTL_MS = 30 * 60 * 1000;
+const BOT_SESSION_STARTED_AT_MS = Date.now();
+
+function pruneProcessedMessageIds(now = Date.now()) {
+  for (const [id, ts] of processedMessageIds.entries()) {
+    if (now - ts > MESSAGE_ID_TTL_MS) {
+      processedMessageIds.delete(id);
+    }
+  }
+}
+
+function hasProcessedMessage(msg) {
+  const id = msg?.key?.id;
+  const jid = msg?.key?.remoteJid || "";
+  if (!id) return false;
+
+  const dedupeKey = `${jid}:${id}`;
+
+  const now = Date.now();
+  pruneProcessedMessageIds(now);
+
+  if (processedMessageIds.has(dedupeKey)) {
+    return true;
+  }
+
+  processedMessageIds.set(dedupeKey, now);
+  return false;
+}
+
+function toTimestampMs(rawTs) {
+  if (!rawTs) return null;
+
+  if (typeof rawTs === "number") {
+    return rawTs > 1e12 ? rawTs : rawTs * 1000;
+  }
+
+  if (typeof rawTs === "object") {
+    if (typeof rawTs.toNumber === "function") {
+      const n = rawTs.toNumber();
+      return n > 1e12 ? n : n * 1000;
+    }
+
+    if (typeof rawTs.low === "number") {
+      const n = rawTs.low;
+      return n > 1e12 ? n : n * 1000;
+    }
+  }
+
+  return null;
+}
+
+function isStaleInboundMessage(msg) {
+  const tsMs = toTimestampMs(msg?.messageTimestamp);
+  if (!tsMs) return true;
+
+  // Replayed append history is usually older than the current runtime session.
+  // Keep a small grace window to avoid clock skew issues.
+  return tsMs < BOT_SESSION_STARTED_AT_MS - 60 * 1000;
+}
+
+function shouldSkipAsStaleMessage(msg, type) {
+  // Only "append" should be filtered for replayed history.
+  // "notify" is the primary signal for a new inbound user message.
+  if (type !== "append") return false;
+  return isStaleInboundMessage(msg);
+}
 
 function getHistory(chatId) {
   const h = memory.get(chatId) || [];
@@ -586,6 +703,10 @@ function shouldIgnoreMessage(msg, type) {
 
   const jid = msg.key?.remoteJid || "";
 
+  // Process only direct 1:1 chats.
+  // Group traffic causes unrelated events and should never trigger the customer bot flow.
+  if (jid.endsWith("@g.us")) return true;
+
   // Ignore broadcasts and status updates
   if (jid === "status@broadcast") return true;
   if (jid.endsWith("@broadcast")) return true;
@@ -597,8 +718,8 @@ function shouldIgnoreMessage(msg, type) {
   // Ignore if no message object at all
   if (!msg.message) return true;
 
-  // Accept both "notify" (new messages) and "append" (message updates/continuations)
-  // Reject only truly system message types
+  // Accept notify + append. Append can include valid new inbound messages
+  // depending on connection state and Baileys behavior.
   if (type !== "notify" && type !== "append") {
     return true;
   }
@@ -685,8 +806,7 @@ function cleanAnalysisText(text = "") {
 // OpenAI helpers
 // =====================
 async function generateReply(chatId, userText) {
-  const phone = normalizePhone(chatId);
-  const recentMeals = await getUserMeals(phone, 5);
+  const recentMeals = await getUserMeals(chatId, 5);
   const memoryService = await getMemoryService();
 
   let recentMessages = [];
@@ -695,19 +815,19 @@ async function generateReply(chatId, userText) {
 
   if (memoryService) {
     try {
-      recentMessages = await memoryService.getRecentMessages(phone, 10);
+      recentMessages = await memoryService.getRecentMessages(chatId, 10);
     } catch (error) {
       console.log("⚠️ getRecentMessages failed:", error?.message || error);
     }
 
     try {
-      userMemory = await memoryService.getUserMemory(phone);
+      userMemory = await memoryService.getUserMemory(chatId);
     } catch (error) {
       console.log("⚠️ getUserMemory failed:", error?.message || error);
     }
 
     try {
-      latestSummary = await memoryService.getLatestSummary(phone);
+      latestSummary = await memoryService.getLatestSummary(chatId);
     } catch (error) {
       console.log("⚠️ getLatestSummary failed:", error?.message || error);
     }
@@ -914,6 +1034,7 @@ ${clarificationAnswer}
 let sock = null;
 let isStarting = false;
 let reconnectTimer = null;
+let consecutive440Errors = 0;  // Track consecutive code 440 errors for exponential backoff
 
 /**
  * Cleanup corrupted auth_info directory
@@ -976,9 +1097,34 @@ async function startBot() {
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      receiveMessagesInBatches: true,
+      downloadHistory: false,
+      // Returning undefined prevents Baileys from sending retry receipts for group messages
+      // it can't find in local storage — this stops the retry loop that causes code 440 conflicts
+      getMessage: async (key) => {
+        // Only attempt to retrieve messages from direct (non-group) chats
+        if (key.remoteJid?.endsWith("@g.us")) return undefined;
+        return undefined;
+      },
     });
 
     console.log("📝 Setting up event listeners...");
+
+    // Suppress non-fatal decryption errors from group messages to prevent connection drops
+    sock.ev.on("error", (error) => {
+      const msg = error?.message || String(error);
+      // Ignore known group message decryption errors
+      if (
+        msg.includes("MessageCounterError") ||
+        msg.includes("Received message with old counter") ||
+        msg.includes("No session found") ||
+        msg.includes("invalid wire type")
+      ) {
+        // Silent skip - these are harmless group message decryption failures
+        return;
+      }
+      console.log("⚠️ Socket error:", msg);
+    });
 
     // Save credentials whenever updated
     sock.ev.on("creds.update", saveCreds);
@@ -999,6 +1145,7 @@ async function startBot() {
       // Handle successful connection
       if (connection === "open") {
         console.log("✅ Successfully connected to WhatsApp!");
+        consecutive440Errors = 0;  // Reset error counter on success
         isStarting = false;
         
         // Clear reconnection timer
@@ -1057,14 +1204,16 @@ async function startBot() {
 
         // Handle connection conflicts from group chats
         if (reason === 440) {
-          console.log("⚠️ Connection conflict (440) - likely group message issue");
-          console.log("🔄 Attempting to reconnect in 3 seconds...");
+          consecutive440Errors++;
+          const backoffMs = Math.min(10000, 3000 * Math.pow(1.5, consecutive440Errors - 1));
+          console.log(`⚠️ Connection conflict (440) - attempt ${consecutive440Errors}`);
+          console.log(`🔄 Reconnecting in ${Math.round(backoffMs / 1000)}s (exponential backoff)...`);
           isStarting = false;
           if (!reconnectTimer) {
             reconnectTimer = setTimeout(() => {
               reconnectTimer = null;
               startBot();
-            }, 3000);
+            }, backoffMs);
           }
           return;
         }
@@ -1094,18 +1243,39 @@ async function startBot() {
         return;
       }
 
-      const from = msg.key.remoteJid;
-      const fromNumber = normalizePhone(from);
+      if (hasProcessedMessage(msg)) {
+        console.log("⏭️  Skip: Duplicate upsert for message id=%s", msg?.key?.id || "[missing]");
+        return;
+      }
 
-      if (fromNumber === BOT_NUMBER) {
+      if (shouldSkipAsStaleMessage(msg, type)) {
+        console.log("⏭️  Skip: Stale/replayed message id=%s", msg?.key?.id || "[missing]");
+        return;
+      }
+
+      const from = msg.key.remoteJid;
+
+      console.log("msg.key.remoteJid:", msg?.key?.remoteJid);
+      console.log("msg.key.remoteJidAlt:", msg?.key?.remoteJidAlt);
+      console.log("msg.key.participant:", msg?.key?.participant);
+      console.log("msg.key.participantAlt:", msg?.key?.participantAlt);
+
+      const resolvedPhone = await resolvePhoneFromMessageKey(msg, sock);
+
+      if (!resolvedPhone) {
+        console.log("REAL PHONE NOT RESOLVED");
+        return;
+      }
+
+      if (resolvedPhone === BOT_NUMBER) {
         console.log("⏭️  Skip: Bot's own message");
         return;
       }
 
-      if (ALLOWED_NUMBERS.size && !ALLOWED_NUMBERS.has(fromNumber)) {
-        console.log("⏭️  Skip: Not in allowlist (%s)", fromNumber);
-        return;
-      }
+     // if (ALLOWED_NUMBERS.size && !ALLOWED_NUMBERS.has(fromNumber)) {
+       // console.log("⏭️  Skip: Not in allowlist (%s)", fromNumber);
+        //return;
+     // }
 
       const rawMessage = msg.message;
       const m =
@@ -1140,7 +1310,7 @@ async function startBot() {
           const base64 = buffer.toString("base64");
           const dataUrl = `data:${mime};base64,${base64}`;
 
-          addToHistory(from, "user", text ? `[תמונה] ${text}` : "[תמונה]");
+          addToHistory(resolvedPhone, "user", text ? `[תמונה] ${text}` : "[תמונה]");
 
           const analysis = await estimateCaloriesFromImage(dataUrl, text);
 
@@ -1152,7 +1322,7 @@ async function startBot() {
           let uploadedImageUrl = null;
 
           try {
-            uploadedImageUrl = await uploadMealImage(buffer, mime, fromNumber);
+            uploadedImageUrl = await uploadMealImage(buffer, mime, resolvedPhone);
             console.log("✅ image uploaded:", uploadedImageUrl);
           } catch (uploadErr) {
             console.log(
@@ -1176,7 +1346,7 @@ async function startBot() {
 ${clarificationQuestion}`,
           });
 
-          addToHistory(from, "assistant", cleanAnalysisText(analysis));
+          addToHistory(resolvedPhone, "assistant", cleanAnalysisText(analysis));
           return;
         }
 
@@ -1221,8 +1391,12 @@ ${clarificationQuestion}`,
               return;
             }
 
+            console.log("WhatsApp destination:", from);
+            console.log("Resolved real phone:", resolvedPhone);
+            console.log("Saving meal for phone:", resolvedPhone);
+
             const saved = await saveMealEntry({
-              from,
+              phone: resolvedPhone,
               mealNote: p.mealNote,
               analysisText: cleanAnalysisText(p.analysisText),
               imageUrl: p.imageUrl,
@@ -1240,32 +1414,31 @@ ${clarificationQuestion}`,
             return;
           }
 
-          addToHistory(from, "user", cleanText);
+          addToHistory(resolvedPhone, "user", cleanText);
 
-          const phone = normalizePhone(from);
           const memoryService = await getMemoryService();
 
           // Save user message to Firestore
           if (memoryService) {
             try {
-              await memoryService.saveMessage(phone, "user", cleanText);
+              await memoryService.saveMessage(resolvedPhone, "user", cleanText);
               console.log("💾 Firestore: Saved user message");
             } catch (error) {
               console.log("⚠️  Firestore error (save user): %s", error?.message || error);
             }
           }
 
-          const replyData = await generateReply(from, cleanText);
-          const reply = replyData?.reply || replyData;
+      const replyData = await generateReply(resolvedPhone, cleanText);   
+       const reply = replyData?.reply || replyData;
 
           await sock.sendMessage(from, { text: reply });
 
-          addToHistory(from, "assistant", reply);
+          addToHistory(resolvedPhone, "assistant", reply);
 
           // Save assistant message and update memory if needed
           if (memoryService) {
             try {
-              await memoryService.saveMessage(phone, "assistant", reply);
+              await memoryService.saveMessage(resolvedPhone, "assistant", reply);
               console.log("💾 Firestore: Saved assistant message");
             } catch (error) {
               console.log("⚠️  Firestore error (save assistant): %s", error?.message || error);
@@ -1273,7 +1446,7 @@ ${clarificationQuestion}`,
 
             if (replyData?.shouldSaveMemory && replyData?.memoryUpdate) {
               try {
-                await memoryService.upsertUserMemory(phone, replyData.memoryUpdate);
+                await memoryService.upsertUserMemory(resolvedPhone, replyData.memoryUpdate);
                 console.log("💾 Firestore: Updated user memory");
               } catch (error) {
                 console.log("⚠️  Firestore error (update memory): %s", error?.message || error);

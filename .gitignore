@@ -1,5 +1,5 @@
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,28 +7,39 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# Dependencies
+node_modules/
+bot/node_modules/
+
+# Build output
+dist/
+dist-ssr/
 *.local
 
+# Environment variables and secrets
+.env
+bot/.env
+bot/firebase-service-account.json
+firebase-service-account.json
 
+# WhatsApp / Baileys session files
+bot/auth_info/
+bot/auth_info_baileys/
+**/auth_info/
+**/auth_info_baileys/
+
+# Runtime-generated files
+uploads/
+bot/uploads/
+bot/data/
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-.env
-
-node_modules/
-.env
-.DS_Store
-bot/firebase-service-account.json
-bot/auth_info/
-uploads/
