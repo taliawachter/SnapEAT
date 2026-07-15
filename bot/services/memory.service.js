@@ -222,6 +222,86 @@ export async function upsertUserMemory(userId, profileUpdates) {
   }
 }
 
+export async function applyIntelligentMemoryUpdate(
+  userId,
+  {
+    updatedProfile,
+    messageId = "",
+    lastUpdatedCategories = [],
+    lastUpdateSource = "user_message",
+    memoryVersion = 2,
+  } = {}
+) {
+  assertRequiredString(userId, "userId");
+
+  if (!updatedProfile || typeof updatedProfile !== "object" || Array.isArray(updatedProfile)) {
+    throw new Error("updatedProfile must be an object");
+  }
+
+  const normalizedUserId = userId.trim();
+  const normalizedMessageId = String(messageId || "").trim();
+  const normalizedCategories = Array.isArray(lastUpdatedCategories)
+    ? Array.from(new Set(lastUpdatedCategories.map((item) => String(item || "").trim()).filter(Boolean))).slice(0, 30)
+    : [];
+
+  const docRef = db.collection(USER_MEMORIES_COLLECTION).doc(normalizedUserId);
+
+  try {
+    const txResult = await db.runTransaction(async (tx) => {
+      const existingSnap = await tx.get(docRef);
+      const existingData = existingSnap.exists ? existingSnap.data() : {};
+      const processedIds = Array.isArray(existingData?.processedMessageIds)
+        ? existingData.processedMessageIds.map((id) => String(id || "").trim()).filter(Boolean)
+        : [];
+
+      if (normalizedMessageId && processedIds.includes(normalizedMessageId)) {
+        return {
+          duplicate: true,
+          updated: false,
+        };
+      }
+
+      const nextProcessedIds = normalizedMessageId
+        ? [...processedIds.slice(-199), normalizedMessageId]
+        : processedIds.slice(-200);
+
+      const payload = {
+        userId: normalizedUserId,
+        profile: updatedProfile,
+        updatedAt: FieldValue.serverTimestamp(),
+        memoryVersion: Number.isFinite(Number(memoryVersion)) ? Number(memoryVersion) : 2,
+        lastUpdateSource: String(lastUpdateSource || "user_message"),
+        lastUpdatedCategories: normalizedCategories,
+      };
+
+      if (!existingData?.createdAt) {
+        payload.createdAt = FieldValue.serverTimestamp();
+      }
+
+      if (normalizedMessageId) {
+        payload.lastProcessedMessageId = normalizedMessageId;
+        payload.processedMessageIds = nextProcessedIds;
+      }
+
+      tx.set(docRef, payload, { merge: true });
+
+      return {
+        duplicate: false,
+        updated: true,
+      };
+    });
+
+    return txResult;
+  } catch (error) {
+    console.error("Failed to apply intelligent memory update", {
+      userId,
+      messageId: normalizedMessageId,
+      error: error.message,
+    });
+    throw error;
+  }
+}
+
 export async function getLatestSummary(userId) {
   assertRequiredString(userId, "userId");
 

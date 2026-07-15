@@ -16,6 +16,12 @@ import qrcode from "qrcode-terminal";
 import OpenAI from "openai";
 import { fileURLToPath } from "url";
 import { analyzeMealImage } from "./services/meal-analysis.js";
+import {
+  MEMORY_CATEGORIES,
+  mergeLongTermMemoryPatch,
+  sanitizeMemoryPatch,
+  sanitizeProfileForMemoryUpdate,
+} from "./services/memory-update/merge.helper.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,6 +44,21 @@ const parsedMemoryRecentMessagesLimit = Number(process.env.MEMORY_RECENT_MESSAGE
 const MEMORY_RECENT_MESSAGES_LIMIT = Number.isFinite(parsedMemoryRecentMessagesLimit)
   ? Math.max(2, Math.min(20, Math.floor(parsedMemoryRecentMessagesLimit)))
   : DEFAULT_MEMORY_RECENT_MESSAGES_LIMIT;
+
+const DEFAULT_MEMORY_UPDATE_MIN_CONFIDENCE = 0.75;
+const DEFAULT_MEMORY_SAFETY_REMOVAL_MIN_CONFIDENCE = 0.95;
+const MEMORY_UPDATE_MIN_CONFIDENCE = Math.max(
+  0,
+  Math.min(1, Number.isFinite(Number(process.env.MEMORY_UPDATE_MIN_CONFIDENCE))
+    ? Number(process.env.MEMORY_UPDATE_MIN_CONFIDENCE)
+    : DEFAULT_MEMORY_UPDATE_MIN_CONFIDENCE)
+);
+const MEMORY_SAFETY_REMOVAL_MIN_CONFIDENCE = Math.max(
+  0,
+  Math.min(1, Number.isFinite(Number(process.env.MEMORY_SAFETY_REMOVAL_MIN_CONFIDENCE))
+    ? Number(process.env.MEMORY_SAFETY_REMOVAL_MIN_CONFIDENCE)
+    : DEFAULT_MEMORY_SAFETY_REMOVAL_MIN_CONFIDENCE)
+);
 
 function normalizePhone(value = "") {
   let phone = String(value);
@@ -182,14 +203,21 @@ function sanitizeLongTermMemoryForContext(userMemory) {
   if (!profile || typeof profile !== "object") return null;
 
   const fields = [
+    "goals",
     "goalWeight",
     "weight",
     "height",
     "activityLevel",
     "dietPreferences",
     "allergies",
+    "sensitivities",
+    "dietaryRestrictions",
     "likedFoods",
     "dislikedFoods",
+    "eatingHabits",
+    "persistentConstraints",
+    "acceptedRecommendations",
+    "importantNotes",
     "notes",
   ];
 
@@ -406,6 +434,258 @@ async function buildMemoryContext(phone, { currentUserMessage = "", currentMessa
   });
 
   return context;
+}
+
+function parsePatchJson(rawContent = "") {
+  const parsed = parseAssistantJson(rawContent);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return parsed;
+}
+
+function buildMemoryExtractionPrompt({ userMessage, currentMemory, latestSummary }) {
+  const memoryJson = JSON.stringify(currentMemory || {}, null, 2);
+  const summaryText = latestSummary ? String(latestSummary).slice(0, 1500) : "";
+
+  const categories = MEMORY_CATEGORIES.join(", ");
+
+  return `
+את עוזרת תזונה שמחלצת עדכון זיכרון ארוך-טווח מהודעת משתמש אחת.
+
+החזירי JSON בלבד ללא טקסט נוסף.
+
+כללים:
+- השתמשי בעיקר בהודעה הנוכחית כראיה ראשית.
+- אל תסיקי עובדות רפואיות שלא נאמרו במפורש.
+- אל תוסיפי עובדות לא יציבות או חד-פעמיות.
+- אל תשמרי ברכות, מצב רוח רגעי או שיחת חולין.
+- הסירי עובדות רק אם יש ביטול מפורש.
+- להסרת אלרגיה/רגישות נדרשת ודאות גבוהה מאוד.
+
+קטגוריות מותרות בלבד:
+${categories}
+
+החזירי במבנה:
+{
+  "add": { "...": [] },
+  "remove": { "...": [] },
+  "replace": {
+    "goals": null,
+    "dietaryPreferences": null,
+    "dietaryRestrictions": null,
+    "persistentConstraints": null
+  },
+  "confidence": 0,
+  "shouldUpdate": false,
+  "reason": ""
+}
+
+אם אין עדכון יציב: shouldUpdate=false וכל המערכים ריקים.
+
+[CURRENT USER MESSAGE]
+${String(userMessage || "").trim()}
+
+[CURRENT LONG-TERM MEMORY]
+${memoryJson}
+
+[LATEST SUMMARY - OPTIONAL CONTEXT]
+${summaryText || "אין"}
+`.trim();
+}
+
+async function extractMemoryPatchFromMessage({ phone, userMessage, currentMemory, latestSummary }) {
+  console.log("MEMORY UPDATE EXTRACTION STARTED", {
+    phone,
+    source: "model",
+  });
+
+  const prompt = buildMemoryExtractionPrompt({
+    userMessage,
+    currentMemory,
+    latestSummary,
+  });
+
+  const resp = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.1,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const rawContent = String(resp.choices?.[0]?.message?.content || "").trim();
+  const rawPatch = parsePatchJson(rawContent);
+  const patch = sanitizeMemoryPatch(rawPatch);
+
+  console.log("MEMORY UPDATE PATCH READY", {
+    phone,
+    confidence: patch.confidence,
+    shouldUpdate: patch.shouldUpdate,
+  });
+
+  return patch;
+}
+
+const activeMemoryUpdateJobs = new Set();
+
+async function maybeUpdateLongTermMemory({
+  phone,
+  sourceType,
+  messageId,
+  userMessage,
+}) {
+  const normalizedPhone = String(phone || "").trim();
+  const normalizedMessageId = String(messageId || "").trim();
+  const cleanUserMessage = String(userMessage || "").trim();
+
+  console.log("MEMORY UPDATE CHECK", {
+    phone: normalizedPhone,
+    messageId: normalizedMessageId || null,
+    source: sourceType,
+  });
+
+  if (!normalizedPhone || normalizedPhone.includes("@")) {
+    console.log("MEMORY UPDATE SKIPPED", {
+      phone: normalizedPhone || null,
+      messageId: normalizedMessageId || null,
+      reason: "invalid_phone",
+    });
+    return;
+  }
+
+  if (sourceType !== "notify") {
+    console.log("MEMORY UPDATE SKIPPED", {
+      phone: normalizedPhone,
+      messageId: normalizedMessageId || null,
+      reason: "not_notify_event",
+    });
+    return;
+  }
+
+  if (!cleanUserMessage) {
+    console.log("MEMORY UPDATE SKIPPED", {
+      phone: normalizedPhone,
+      messageId: normalizedMessageId || null,
+      reason: "empty_text",
+    });
+    return;
+  }
+
+  if (activeMemoryUpdateJobs.has(normalizedPhone)) {
+    console.log("MEMORY UPDATE LOCKED", {
+      phone: normalizedPhone,
+      messageId: normalizedMessageId || null,
+    });
+    return;
+  }
+
+  activeMemoryUpdateJobs.add(normalizedPhone);
+
+  try {
+    const memoryService = await getMemoryService();
+    if (!memoryService) {
+      console.log("MEMORY UPDATE SKIPPED", {
+        phone: normalizedPhone,
+        messageId: normalizedMessageId || null,
+        reason: "memory_service_unavailable",
+      });
+      return;
+    }
+
+    const [memoryResult, summaryResult] = await Promise.allSettled([
+      memoryService.getUserMemory(normalizedPhone),
+      memoryService.getLatestSummary(normalizedPhone),
+    ]);
+
+    const currentProfile = memoryResult.status === "fulfilled"
+      ? (memoryResult.value?.profile && typeof memoryResult.value.profile === "object"
+        ? memoryResult.value.profile
+        : {})
+      : {};
+
+    const latestSummaryText = summaryResult.status === "fulfilled"
+      ? summaryResult.value?.summary || ""
+      : "";
+
+    const modelMemoryContext = sanitizeProfileForMemoryUpdate(currentProfile);
+
+    const patch = await extractMemoryPatchFromMessage({
+      phone: normalizedPhone,
+      userMessage: cleanUserMessage,
+      currentMemory: modelMemoryContext,
+      latestSummary: latestSummaryText,
+    });
+
+    if (!patch.shouldUpdate) {
+      console.log("MEMORY UPDATE SKIPPED", {
+        phone: normalizedPhone,
+        messageId: normalizedMessageId || null,
+        reason: "model_declined_update",
+        confidence: patch.confidence,
+      });
+      return;
+    }
+
+    if (patch.confidence < MEMORY_UPDATE_MIN_CONFIDENCE) {
+      console.log("MEMORY UPDATE SKIPPED", {
+        phone: normalizedPhone,
+        messageId: normalizedMessageId || null,
+        reason: "low_confidence",
+        confidence: patch.confidence,
+      });
+      return;
+    }
+
+    const mergeResult = mergeLongTermMemoryPatch(currentProfile, patch, {
+      safetyRemovalMinConfidence: MEMORY_SAFETY_REMOVAL_MIN_CONFIDENCE,
+    });
+
+    if (mergeResult.blockedRemovals.length) {
+      console.log("MEMORY SAFETY REMOVAL BLOCKED", {
+        phone: normalizedPhone,
+        messageId: normalizedMessageId || null,
+        confidence: patch.confidence,
+        categories: mergeResult.blockedRemovals.map((item) => item.category),
+      });
+    }
+
+    if (!mergeResult.changed) {
+      console.log("MEMORY UPDATE NO CHANGES", {
+        phone: normalizedPhone,
+        messageId: normalizedMessageId || null,
+      });
+      return;
+    }
+
+    const saveResult = await memoryService.applyIntelligentMemoryUpdate(normalizedPhone, {
+      updatedProfile: mergeResult.updatedMemory,
+      messageId: normalizedMessageId,
+      lastUpdatedCategories: mergeResult.changedCategories,
+      lastUpdateSource: "user_message",
+      memoryVersion: 2,
+    });
+
+    if (saveResult?.duplicate) {
+      console.log("MEMORY UPDATE SKIPPED", {
+        phone: normalizedPhone,
+        messageId: normalizedMessageId || null,
+        reason: "duplicate_message",
+      });
+      return;
+    }
+
+    console.log("MEMORY UPDATE SAVED", {
+      phone: normalizedPhone,
+      messageId: normalizedMessageId || null,
+      changedCategories: mergeResult.changedCategories,
+      confidence: patch.confidence,
+    });
+  } catch (error) {
+    console.log("MEMORY UPDATE FAILED", {
+      phone: normalizedPhone,
+      messageId: normalizedMessageId || null,
+      error: error?.message || error,
+    });
+  } finally {
+    activeMemoryUpdateJobs.delete(normalizedPhone);
+  }
 }
 
 function formatUserMemoryForPrompt(userMemory) {
@@ -1855,15 +2135,21 @@ ${clarificationQuestion}`,
             } catch (error) {
               console.log("⚠️  Firestore error (save assistant): %s", error?.message || error);
             }
+          }
 
-            if (replyData?.shouldSaveMemory && replyData?.memoryUpdate) {
-              try {
-                await memoryService.upsertUserMemory(resolvedPhone, replyData.memoryUpdate);
-                console.log("💾 Firestore: Updated user memory");
-              } catch (error) {
-                console.log("⚠️  Firestore error (update memory): %s", error?.message || error);
-              }
-            }
+          if (memoryService) {
+            void maybeUpdateLongTermMemory({
+              phone: resolvedPhone,
+              sourceType: type,
+              messageId: msg?.key?.id || "",
+              userMessage: cleanText,
+            }).catch((error) => {
+              console.log("MEMORY UPDATE FAILED", {
+                phone: resolvedPhone,
+                messageId: msg?.key?.id || null,
+                error: error?.message || error,
+              });
+            });
           }
 
           if (memoryService) {
