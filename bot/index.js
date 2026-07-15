@@ -25,6 +25,14 @@ const __dirname = path.dirname(__filename);
 // =====================
 const PORT = Number(process.env.PORT || 3000);
 
+const DEFAULT_CONVERSATION_SUMMARY_THRESHOLD = 20;
+const parsedConversationSummaryThreshold = Number(process.env.CONVERSATION_SUMMARY_THRESHOLD);
+const CONVERSATION_SUMMARY_THRESHOLD = Number.isFinite(parsedConversationSummaryThreshold)
+  && parsedConversationSummaryThreshold > 0
+  ? Math.floor(parsedConversationSummaryThreshold)
+  : DEFAULT_CONVERSATION_SUMMARY_THRESHOLD;
+const CONVERSATION_SUMMARY_MODEL = "gpt-4o-mini";
+
 function normalizePhone(value = "") {
   let phone = String(value);
 
@@ -46,9 +54,14 @@ const BOT_NUMBER = normalizePhone(process.env.PAIRING_PHONE || "");
 const ALLOWED_NUMBERS = new Set(
   (process.env.ALLOWED_CHATS || "")
     .split(",")
-    .map((s) => normalizePhone(s))
+    .map((phone) => normalizePhone(phone))
     .filter(Boolean)
 );
+
+if (ALLOWED_NUMBERS.size > 0) {
+  const label = ALLOWED_NUMBERS.size === 1 ? "phone" : "phones";
+  console.log(`ALLOWLIST ENABLED: ${ALLOWED_NUMBERS.size} authorized ${label}`);
+}
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -159,6 +172,201 @@ function formatUserMemoryForPrompt(userMemory) {
     return JSON.stringify(userMemory.profile, null, 2);
   } catch {
     return "אין זיכרון משתמש ארוך-טווח.";
+  }
+}
+
+function formatConversationMessagesForSummaryPrompt(messages = []) {
+  if (!Array.isArray(messages) || !messages.length) return "אין הודעות חדשות לסיכום.";
+
+  return messages
+    .map((msg, index) => {
+      const role = String(msg?.role || "user");
+      const content = String(msg?.content || "").trim();
+      const ts = msg?.createdAt?.toDate?.() || msg?.createdAt || null;
+      const iso = ts ? new Date(ts).toISOString() : "unknown-time";
+      return `${index + 1}. [${iso}] ${role}: ${content}`;
+    })
+    .join("\n");
+}
+
+function timestampToMs(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value?.toDate === "function") {
+    const dt = value.toDate();
+    return dt instanceof Date ? dt.getTime() : null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+}
+
+async function createConversationSummaryText({ previousSummary, newMessages, userMemory }) {
+  const previousSummaryText = previousSummary?.summary
+    ? String(previousSummary.summary)
+    : "אין סיכום קודם.";
+
+  const userMemoryText = formatUserMemoryForPrompt(userMemory);
+  const messagesText = formatConversationMessagesForSummaryPrompt(newMessages);
+
+  const prompt = `
+את עוזרת תזונה שמסכמת שיחה למטרות המשכיות טיפולית.
+
+הוראות:
+- כתבי בעברית בלבד.
+- כתבי סיכום תמציתי, עובדתי ומובנה לפי הכותרות הבאות בדיוק:
+1) מטרות המשתמש
+2) העדפות תזונתיות
+3) מגבלות, אלרגיות ורגישויות
+4) ארוחות ודפוסים חשובים
+5) החלטות או המלצות שניתנו
+6) מידע שחשוב להמשך השיחה
+- אל תמציאי עובדות שלא הופיעו במידע.
+- אל תכללי לוגים טכניים או מידע מערכת.
+- אל תכללי ברכות לא רלוונטיות.
+- אל תתני אבחנה רפואית.
+- הבליטי עובדות רלוונטיות בעיקר מהתקופה האחרונה, תוך שמירה על עובדות ארוכות טווח חשובות.
+
+סיכום קודם:
+${previousSummaryText}
+
+זיכרון משתמש ארוך-טווח:
+${userMemoryText}
+
+הודעות חדשות שטרם סוכמו:
+${messagesText}
+`.trim();
+
+  const resp = await client.chat.completions.create({
+    model: CONVERSATION_SUMMARY_MODEL,
+    temperature: 0.2,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  return String(resp.choices?.[0]?.message?.content || "").trim();
+}
+
+const activeSummaryJobs = new Set();
+
+async function maybeCreateConversationSummary(phone) {
+  const normalizedPhone = String(phone || "").trim();
+  if (!normalizedPhone || normalizedPhone.includes("@")) {
+    return;
+  }
+
+  if (activeSummaryJobs.has(normalizedPhone)) {
+    console.log("SUMMARY LOCKED: already running", {
+      phone: normalizedPhone,
+    });
+    return;
+  }
+
+  activeSummaryJobs.add(normalizedPhone);
+
+  let newEligibleMessages = 0;
+
+  try {
+    const memoryService = await getMemoryService();
+    if (!memoryService) return;
+
+    const latestSummary = await memoryService.getLatestSummary(normalizedPhone);
+    const unsummarized = await memoryService.getUnsummarizedMessages(normalizedPhone, {
+      afterTimestamp: latestSummary?.summarizedUntil || null,
+      limit: Math.max(CONVERSATION_SUMMARY_THRESHOLD * 5, 120),
+      lookbackDays: 90,
+    });
+
+    const eligibleMessages = unsummarized.filter((msg) => {
+      const role = String(msg?.role || "").trim();
+      const content = String(msg?.content || "").trim();
+      return (role === "user" || role === "assistant") && Boolean(content);
+    });
+
+    newEligibleMessages = eligibleMessages.length;
+
+    console.log("SUMMARY CHECK", {
+      phone: normalizedPhone,
+      newEligibleMessages,
+      threshold: CONVERSATION_SUMMARY_THRESHOLD,
+    });
+
+    if (newEligibleMessages < CONVERSATION_SUMMARY_THRESHOLD) {
+      console.log("SUMMARY SKIPPED: threshold not reached", {
+        phone: normalizedPhone,
+        newEligibleMessages,
+      });
+      return;
+    }
+
+    const maxBatchSize = CONVERSATION_SUMMARY_THRESHOLD * 3;
+    const messagesToSummarize = eligibleMessages.slice(0, maxBatchSize);
+
+    const firstMessage = messagesToSummarize[0] || null;
+    const lastMessage = messagesToSummarize[messagesToSummarize.length - 1] || null;
+    if (!lastMessage?.createdAt) {
+      console.log("SUMMARY SKIPPED: threshold not reached", {
+        phone: normalizedPhone,
+        newEligibleMessages: 0,
+      });
+      return;
+    }
+
+    const latestSummaryUntilMs = timestampToMs(latestSummary?.summarizedUntil);
+    const candidateSummaryUntilMs = timestampToMs(lastMessage?.createdAt);
+
+    if (
+      latestSummaryUntilMs !== null
+      && candidateSummaryUntilMs !== null
+      && candidateSummaryUntilMs <= latestSummaryUntilMs
+    ) {
+      console.log("SUMMARY SKIPPED: threshold not reached", {
+        phone: normalizedPhone,
+        newEligibleMessages: 0,
+      });
+      return;
+    }
+
+    console.log("SUMMARY GENERATION STARTED", {
+      phone: normalizedPhone,
+      newEligibleMessages: messagesToSummarize.length,
+    });
+
+    const userMemory = await memoryService.getUserMemory(normalizedPhone);
+    const summaryText = await createConversationSummaryText({
+      previousSummary: latestSummary,
+      newMessages: messagesToSummarize,
+      userMemory,
+    });
+
+    if (!summaryText) {
+      throw new Error("Empty summary generated");
+    }
+
+    const savedSummary = await memoryService.saveConversationSummary(normalizedPhone, {
+      summary: summaryText,
+      phone: normalizedPhone,
+      messageCount: messagesToSummarize.length,
+      previousSummaryId: latestSummary?.id || null,
+      summarizedFrom: firstMessage?.createdAt || null,
+      summarizedUntil: lastMessage?.createdAt,
+      summarizedFromMessageId: firstMessage?.id || null,
+      summarizedUntilMessageId: lastMessage?.id || null,
+      model: CONVERSATION_SUMMARY_MODEL,
+      version: 1,
+    });
+
+    console.log("SUMMARY SAVED", {
+      phone: normalizedPhone,
+      newEligibleMessages: messagesToSummarize.length,
+      summaryId: savedSummary?.id || null,
+    });
+  } catch (error) {
+    console.log("SUMMARY FAILED", {
+      phone: normalizedPhone,
+      newEligibleMessages,
+      error: error?.message || error,
+    });
+  } finally {
+    activeSummaryJobs.delete(normalizedPhone);
   }
 }
 
@@ -1263,7 +1471,12 @@ async function startBot() {
       const resolvedPhone = await resolvePhoneFromMessageKey(msg, sock);
 
       if (!resolvedPhone) {
-        console.log("REAL PHONE NOT RESOLVED");
+        console.log("SKIP: real phone was not resolved");
+        return;
+      }
+
+      if (!ALLOWED_NUMBERS.has(resolvedPhone)) {
+        console.log(`SKIP: phone not allowed (${resolvedPhone})`);
         return;
       }
 
@@ -1271,11 +1484,6 @@ async function startBot() {
         console.log("⏭️  Skip: Bot's own message");
         return;
       }
-
-     // if (ALLOWED_NUMBERS.size && !ALLOWED_NUMBERS.has(fromNumber)) {
-       // console.log("⏭️  Skip: Not in allowlist (%s)", fromNumber);
-        //return;
-     // }
 
       const rawMessage = msg.message;
       const m =
@@ -1421,7 +1629,11 @@ ${clarificationQuestion}`,
           // Save user message to Firestore
           if (memoryService) {
             try {
-              await memoryService.saveMessage(resolvedPhone, "user", cleanText);
+              await memoryService.saveMessage(resolvedPhone, "user", cleanText, {
+                sourceType: type,
+                messageId: msg?.key?.id || "",
+                isSummaryEligible: type === "notify" && Boolean(cleanText),
+              });
               console.log("💾 Firestore: Saved user message");
             } catch (error) {
               console.log("⚠️  Firestore error (save user): %s", error?.message || error);
@@ -1438,7 +1650,11 @@ ${clarificationQuestion}`,
           // Save assistant message and update memory if needed
           if (memoryService) {
             try {
-              await memoryService.saveMessage(resolvedPhone, "assistant", reply);
+              await memoryService.saveMessage(resolvedPhone, "assistant", reply, {
+                sourceType: type,
+                messageId: msg?.key?.id || "",
+                isSummaryEligible: type === "notify" && Boolean(reply?.trim?.() || ""),
+              });
               console.log("💾 Firestore: Saved assistant message");
             } catch (error) {
               console.log("⚠️  Firestore error (save assistant): %s", error?.message || error);
@@ -1452,6 +1668,16 @@ ${clarificationQuestion}`,
                 console.log("⚠️  Firestore error (update memory): %s", error?.message || error);
               }
             }
+          }
+
+          if (memoryService) {
+            void maybeCreateConversationSummary(resolvedPhone).catch((error) => {
+              console.log("SUMMARY FAILED", {
+                phone: resolvedPhone,
+                newEligibleMessages: 0,
+                error: error?.message || error,
+              });
+            });
           }
 
           return;

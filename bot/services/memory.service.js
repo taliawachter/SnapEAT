@@ -1,4 +1,5 @@
 import { db } from "../firebase-admin.js";
+import { FieldValue } from "firebase-admin/firestore";
 
 const CHAT_MESSAGES_COLLECTION = "chatMessages";
 const USER_MEMORIES_COLLECTION = "userMemories";
@@ -70,7 +71,30 @@ function sanitizeMemoryUpdate(memoryUpdate) {
   return Object.keys(filtered).length ? filtered : null;
 }
 
-export async function saveMessage(userId, role, content) {
+function toDateOrNull(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value?.toDate === "function") {
+    const parsed = value.toDate();
+    return parsed instanceof Date && !Number.isNaN(parsed.getTime()) ? parsed : null;
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function toMillis(value) {
+  const asDate = toDateOrNull(value);
+  return asDate ? asDate.getTime() : null;
+}
+
+function sanitizeDocIdPart(value = "") {
+  return String(value || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 120);
+}
+
+export async function saveMessage(userId, role, content, options = {}) {
   assertRequiredString(userId, "userId");
   assertRequiredString(role, "role");
   assertRole(role);
@@ -79,6 +103,13 @@ export async function saveMessage(userId, role, content) {
   const normalizedUserId = userId.trim();
   const normalizedRole = role.trim();
   const normalizedContent = content.trim();
+  const sourceType = String(options?.sourceType || "").trim();
+  const messageId = String(options?.messageId || "").trim();
+  const explicitSummaryEligibility = options?.isSummaryEligible;
+
+  const isSummaryEligible = typeof explicitSummaryEligibility === "boolean"
+    ? explicitSummaryEligibility
+    : normalizedRole !== "system" && normalizedContent.length > 0 && sourceType === "notify";
 
   try {
     const payload = {
@@ -86,6 +117,9 @@ export async function saveMessage(userId, role, content) {
       role: normalizedRole,
       content: normalizedContent,
       createdAt: new Date(),
+      sourceType: sourceType || null,
+      messageId: messageId || null,
+      isSummaryEligible,
     };
 
     const docRef = await db.collection(CHAT_MESSAGES_COLLECTION).add(payload);
@@ -194,12 +228,21 @@ export async function getLatestSummary(userId) {
   const normalizedUserId = userId.trim();
 
   try {
-    const snapshot = await db
+    let snapshot = await db
       .collection(CONVERSATION_SUMMARIES_COLLECTION)
       .where("userId", "==", normalizedUserId)
-      .orderBy("createdAt", "desc")
+      .orderBy("summarizedUntil", "desc")
       .limit(1)
       .get();
+
+    if (snapshot.empty) {
+      snapshot = await db
+        .collection(CONVERSATION_SUMMARIES_COLLECTION)
+        .where("userId", "==", normalizedUserId)
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get();
+    }
 
     if (snapshot.empty) return null;
 
@@ -218,24 +261,122 @@ export async function getLatestSummary(userId) {
   }
 }
 
-export async function saveConversationSummary(userId, summary) {
+export async function getUnsummarizedMessages(
+  userId,
+  { afterTimestamp = null, limit = 120, lookbackDays = 90 } = {}
+) {
   assertRequiredString(userId, "userId");
-  assertRequiredString(summary, "summary");
 
   const normalizedUserId = userId.trim();
-  const normalizedSummary = summary.trim();
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit)
+    ? Math.max(1, Math.min(500, parsedLimit))
+    : 120;
+
+  const parsedLookbackDays = Number(lookbackDays);
+  const safeLookbackDays = Number.isFinite(parsedLookbackDays)
+    ? Math.max(30, Math.min(90, parsedLookbackDays))
+    : 90;
+
+  const afterDate = toDateOrNull(afterTimestamp);
+  const lookbackStart = new Date(Date.now() - safeLookbackDays * 24 * 60 * 60 * 1000);
+
+  try {
+    let query = db
+      .collection(CHAT_MESSAGES_COLLECTION)
+      .where("userId", "==", normalizedUserId)
+      .where("isSummaryEligible", "==", true)
+      .where("role", "in", ["user", "assistant"])
+      .orderBy("createdAt", "asc");
+
+    if (afterDate) {
+      query = query.where("createdAt", ">", afterDate);
+    } else {
+      query = query.where("createdAt", ">=", lookbackStart);
+    }
+
+    const snapshot = await query.limit(safeLimit).get();
+
+    return snapshot.docs
+      .map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }))
+      .filter((item) => {
+        const role = String(item?.role || "").trim();
+        const content = String(item?.content || "").trim();
+        return (role === "user" || role === "assistant") && Boolean(content);
+      });
+  } catch (error) {
+    console.error("Failed to fetch unsummarized messages", {
+      userId,
+      error: error.message,
+    });
+    throw error;
+  }
+}
+
+export async function saveConversationSummary(userId, summary) {
+  assertRequiredString(userId, "userId");
+
+  const normalizedUserId = userId.trim();
+  const isLegacySummaryString = typeof summary === "string";
+  const summaryText = isLegacySummaryString ? summary : summary?.summary;
+  assertRequiredString(summaryText, "summary");
+
+  const normalizedSummary = String(summaryText).trim();
+  const summaryData = isLegacySummaryString ? {} : summary;
+  const phone = String(summaryData?.phone || normalizedUserId).trim();
+  assertRequiredString(phone, "phone");
+
+  const parsedCount = Number(summaryData?.messageCount ?? 0);
+  const messageCount = Number.isFinite(parsedCount) ? Math.max(0, Math.floor(parsedCount)) : 0;
+
+  const previousSummaryId = summaryData?.previousSummaryId
+    ? String(summaryData.previousSummaryId).trim()
+    : null;
+
+  const summarizedFrom = toDateOrNull(summaryData?.summarizedFrom);
+  const summarizedUntil = toDateOrNull(summaryData?.summarizedUntil) || new Date();
+  const model = String(summaryData?.model || "gpt-4o-mini").trim();
+  const parsedVersion = Number(summaryData?.version ?? 1);
+  const version = Number.isFinite(parsedVersion) ? Math.max(1, Math.floor(parsedVersion)) : 1;
+  const summarizedFromMessageId = summaryData?.summarizedFromMessageId
+    ? String(summaryData.summarizedFromMessageId).trim()
+    : null;
+  const summarizedUntilMessageId = summaryData?.summarizedUntilMessageId
+    ? String(summaryData.summarizedUntilMessageId).trim()
+    : null;
+
+  const untilMs = toMillis(summarizedUntil) || Date.now();
+  const stableDocId = [
+    "summary",
+    sanitizeDocIdPart(normalizedUserId),
+    String(untilMs),
+    String(messageCount),
+  ].join("_");
 
   try {
     const payload = {
       userId: normalizedUserId,
+      phone,
       summary: normalizedSummary,
-      createdAt: new Date(),
+      messageCount,
+      previousSummaryId,
+      summarizedFrom,
+      summarizedUntil,
+      createdAt: FieldValue.serverTimestamp(),
+      model,
+      version,
+      summarizedFromMessageId,
+      summarizedUntilMessageId,
     };
 
-    const docRef = await db.collection(CONVERSATION_SUMMARIES_COLLECTION).add(payload);
+    const docRef = db.collection(CONVERSATION_SUMMARIES_COLLECTION).doc(stableDocId);
+    await docRef.create(payload);
 
     return {
-      id: docRef.id,
+      id: stableDocId,
       ...payload,
     };
   } catch (error) {
