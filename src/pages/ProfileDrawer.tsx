@@ -145,13 +145,8 @@ export default function ProfileDrawer({
           </div>
         </div>
 
-        <div className="px-6 pt-8">
-          <div className="flex items-center justify-between border-b border-bbrown py-5 text-dark">
-            <User className="h-6 w-6" />
-            <span className="text-s font-semibold">נתונים אישיים</span>
-          </div>
-
-          <div className="border-b border-bbrown py-5">
+        <div className="px-6 pt-1">
+          <div className="border-b border-bbrown py-3">
             <button
               type="button"
               onClick={handleLogout}
