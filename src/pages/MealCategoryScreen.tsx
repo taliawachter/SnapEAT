@@ -6,6 +6,20 @@ import type { FirebaseError } from "firebase/app";
 import { ChevronRight, Heart, Pencil } from "lucide-react";
 import { auth, db } from "../firebase.js";
 import { addFavorite, isMealFavorited } from "../utils/favoritesApi.js";
+import { updateDiaryMeal } from "../utils/mealsApi.js";
+import {
+  formatEstimatedNumericDisplay,
+  formatEstimatedQuantityDisplay,
+  normalizeMealRecordForDisplay,
+} from "../../shared/meal-analysis.js";
+import {
+  applyMealUpdateLocally,
+  buildCanonicalMealUpdatePayload,
+  getMacroMismatchWarning,
+  normalizeMealForEdit,
+  recalculateTotalsFromIngredients,
+  validateMealEditDraft,
+} from "../../shared/meal-edit.js";
 
 const DEBUG_MEAL_ANALYSIS = import.meta.env.VITE_DEBUG_MEAL_ANALYSIS === "true";
 
@@ -134,6 +148,7 @@ function MealCardShell({
   details,
   isFavorited,
   isSavingFavorite,
+  onEditClick,
   onFavoriteClick,
   expanded = false,
 }: {
@@ -142,6 +157,7 @@ function MealCardShell({
   details: string[];
   isFavorited: boolean;
   isSavingFavorite: boolean;
+  onEditClick: () => void;
   onFavoriteClick: () => void;
   expanded?: boolean;
 }) {
@@ -150,7 +166,14 @@ function MealCardShell({
       <div className="flex items-center justify-between border-b border-brown px-5 py-4">
         <div className="flex items-center gap-4 text-orange">
            <h2 className="text-xl font-bold text-black">{title}</h2>
-          <button type="button" aria-label="עריכה">
+          <button
+            type="button"
+            aria-label="עריכה"
+            onClick={(event) => {
+              event.stopPropagation();
+              onEditClick();
+            }}
+          >
             <Pencil className="h-8 w-8" />
           </button>
           <button
@@ -192,6 +215,333 @@ function MealCardShell({
 
       <div className="bg-borange px-6 py-4 text-left text-3xl font-bold text-orange">
         סה״כ: {calories} קל׳
+      </div>
+    </div>
+  );
+}
+
+function toInputNumberValue(value: number | null | undefined) {
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function MealEditModal({
+  mealDraft,
+  setMealDraft,
+  validationErrors,
+  saveError,
+  isSaving,
+  mismatchWarning,
+  onRecalculate,
+  onCancel,
+  onSave,
+}: {
+  mealDraft: any;
+  setMealDraft: (updater: (previous: any) => any) => void;
+  validationErrors: string[];
+  saveError: string | null;
+  isSaving: boolean;
+  mismatchWarning: string | null;
+  onRecalculate: () => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 px-4 pb-6"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-150 rounded-3xl bg-cream p-5 shadow-2xl"
+        dir="rtl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <h2 className="text-xl font-bold text-orange">עריכת ארוחה</h2>
+        <p className="mt-1 text-sm text-placeholder">עדכני את הפרטים ושמרי</p>
+
+        <div className="mt-4 space-y-3 max-h-[65vh] overflow-y-auto pr-1">
+          <input
+            type="text"
+            value={mealDraft.mealName}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              setMealDraft((previous) => ({ ...previous, mealName: nextValue }));
+            }}
+            placeholder="שם הארוחה"
+            className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+          />
+
+          <select
+            value={mealDraft.mealType}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              setMealDraft((previous) => ({ ...previous, mealType: nextValue }));
+            }}
+            className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+          >
+            <option value="breakfast">ארוחת בוקר</option>
+            <option value="lunch">ארוחת צהריים</option>
+            <option value="dinner">ארוחת ערב</option>
+            <option value="snack">ארוחת ביניים</option>
+          </select>
+
+          <input
+            type="text"
+            inputMode="decimal"
+            value={toInputNumberValue(mealDraft.totalEstimatedQuantityGrams)}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              setMealDraft((previous) => ({
+                ...previous,
+                totalEstimatedQuantityGrams: nextValue,
+              }));
+            }}
+            placeholder="כמות כוללת משוערת (גרם)"
+            className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+          />
+
+          <div className="grid grid-cols-2 gap-2">
+            <input
+              type="text"
+              inputMode="decimal"
+              value={toInputNumberValue(mealDraft.totalCalories)}
+              onChange={(event) => {
+                const nextValue = event.target.value;
+                setMealDraft((previous) => ({ ...previous, totalCalories: nextValue }));
+              }}
+              placeholder="קלוריות"
+              className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+            />
+            <input
+              type="text"
+              inputMode="decimal"
+              value={toInputNumberValue(mealDraft.totalProteinGrams)}
+              onChange={(event) => {
+                const nextValue = event.target.value;
+                setMealDraft((previous) => ({ ...previous, totalProteinGrams: nextValue }));
+              }}
+              placeholder="חלבון (גרם)"
+              className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+            />
+            <input
+              type="text"
+              inputMode="decimal"
+              value={toInputNumberValue(mealDraft.totalCarbohydratesGrams)}
+              onChange={(event) => {
+                const nextValue = event.target.value;
+                setMealDraft((previous) => ({ ...previous, totalCarbohydratesGrams: nextValue }));
+              }}
+              placeholder="פחמימות (גרם)"
+              className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+            />
+            <input
+              type="text"
+              inputMode="decimal"
+              value={toInputNumberValue(mealDraft.totalFatGrams)}
+              onChange={(event) => {
+                const nextValue = event.target.value;
+                setMealDraft((previous) => ({ ...previous, totalFatGrams: nextValue }));
+              }}
+              placeholder="שומן (גרם)"
+              className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-3 text-right outline-none"
+            />
+          </div>
+
+          <div className="rounded-2xl border border-[#DDD4C8] bg-white p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="font-bold text-dark">רכיבים</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setMealDraft((previous) => ({
+                    ...previous,
+                    ingredients: [
+                      ...(Array.isArray(previous.ingredients) ? previous.ingredients : []),
+                      {
+                        name: "",
+                        estimatedQuantity: "",
+                        calories: "",
+                        proteinGrams: "",
+                        carbohydratesGrams: "",
+                        fatGrams: "",
+                      },
+                    ],
+                  }));
+                }}
+                className="rounded-full border border-orange px-3 py-1 text-sm font-semibold text-orange"
+              >
+                + הוסף רכיב
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {(mealDraft.ingredients || []).map((ingredient: any, ingredientIndex: number) => (
+                <div key={`ingredient-${ingredientIndex}`} className="rounded-xl border border-orange/20 p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="font-semibold text-dark">מרכיב {ingredientIndex + 1}</p>
+                    <button
+                      type="button"
+                      className="text-sm font-semibold text-orange"
+                      onClick={() => {
+                        setMealDraft((previous) => ({
+                          ...previous,
+                          ingredients: (previous.ingredients || []).filter((_: unknown, index: number) => index !== ingredientIndex),
+                        }));
+                      }}
+                    >
+                      הסר
+                    </button>
+                  </div>
+
+                  <div className="space-y-2">
+                    <input
+                      type="text"
+                      value={ingredient.name || ""}
+                      placeholder="שם רכיב"
+                      onChange={(event) => {
+                        const nextValue = event.target.value;
+                        setMealDraft((previous) => ({
+                          ...previous,
+                          ingredients: (previous.ingredients || []).map((current: any, index: number) => (
+                            index === ingredientIndex ? { ...current, name: nextValue } : current
+                          )),
+                        }));
+                      }}
+                      className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-2 text-right outline-none"
+                    />
+                    <input
+                      type="text"
+                      value={ingredient.estimatedQuantity || ""}
+                      placeholder="כמות משוערת"
+                      onChange={(event) => {
+                        const nextValue = event.target.value;
+                        setMealDraft((previous) => ({
+                          ...previous,
+                          ingredients: (previous.ingredients || []).map((current: any, index: number) => (
+                            index === ingredientIndex ? { ...current, estimatedQuantity: nextValue } : current
+                          )),
+                        }));
+                      }}
+                      className="w-full rounded-xl border border-[#DDD4C8] bg-white px-3 py-2 text-right outline-none"
+                    />
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={toInputNumberValue(ingredient.calories)}
+                        placeholder="קלוריות"
+                        onChange={(event) => {
+                          const nextValue = event.target.value;
+                          setMealDraft((previous) => ({
+                            ...previous,
+                            ingredients: (previous.ingredients || []).map((current: any, index: number) => (
+                              index === ingredientIndex ? { ...current, calories: nextValue } : current
+                            )),
+                          }));
+                        }}
+                        className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-2 text-right outline-none"
+                      />
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={toInputNumberValue(ingredient.proteinGrams)}
+                        placeholder="חלבון"
+                        onChange={(event) => {
+                          const nextValue = event.target.value;
+                          setMealDraft((previous) => ({
+                            ...previous,
+                            ingredients: (previous.ingredients || []).map((current: any, index: number) => (
+                              index === ingredientIndex ? { ...current, proteinGrams: nextValue } : current
+                            )),
+                          }));
+                        }}
+                        className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-2 text-right outline-none"
+                      />
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={toInputNumberValue(ingredient.carbohydratesGrams)}
+                        placeholder="פחמימות"
+                        onChange={(event) => {
+                          const nextValue = event.target.value;
+                          setMealDraft((previous) => ({
+                            ...previous,
+                            ingredients: (previous.ingredients || []).map((current: any, index: number) => (
+                              index === ingredientIndex ? { ...current, carbohydratesGrams: nextValue } : current
+                            )),
+                          }));
+                        }}
+                        className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-2 text-right outline-none"
+                      />
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={toInputNumberValue(ingredient.fatGrams)}
+                        placeholder="שומן"
+                        onChange={(event) => {
+                          const nextValue = event.target.value;
+                          setMealDraft((previous) => ({
+                            ...previous,
+                            ingredients: (previous.ingredients || []).map((current: any, index: number) => (
+                              index === ingredientIndex ? { ...current, fatGrams: nextValue } : current
+                            )),
+                          }));
+                        }}
+                        className="rounded-xl border border-[#DDD4C8] bg-white px-3 py-2 text-right outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onRecalculate}
+            className="w-full rounded-full border border-orange px-4 py-2 font-semibold text-orange"
+          >
+            חשב מחדש סה״כ לפי רכיבים
+          </button>
+
+          {mismatchWarning && (
+            <p className="rounded-xl bg-yellow-50 px-3 py-2 text-sm font-semibold text-yellow-800">
+              {mismatchWarning}
+            </p>
+          )}
+
+          {validationErrors.length > 0 && (
+            <div className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-700">
+              {validationErrors.map((error, index) => (
+                <p key={`validation-error-${index}`}>{error}</p>
+              ))}
+            </div>
+          )}
+
+          {saveError && (
+            <p className="rounded-xl bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+              {saveError}
+            </p>
+          )}
+        </div>
+
+        <div className="mt-4 flex gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="flex-1 rounded-full border border-orange py-3 font-bold text-orange"
+          >
+            ביטול
+          </button>
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={isSaving}
+            className="flex-1 rounded-full bg-orange py-3 font-bold text-white shadow-md disabled:opacity-60"
+          >
+            {isSaving ? "שומר..." : "שמור שינויים"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -239,66 +589,14 @@ function extractEstimatedCaloriesFromText(text = "") {
   return 0;
 }
 
-function normalizeNumber(value: unknown) {
-  if (value === null || value === undefined || value === "") return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
 function normalizeText(value: unknown) {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
 }
 
-function valueOrMissing(value: unknown) {
-  return value ?? "לא זמין";
-}
-
-function getIngredientField(ingredient: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = ingredient[key];
-    if (value !== undefined && value !== null && value !== "") return value;
-  }
-  return undefined;
-}
-
-function getStructuredIngredients(meal: MealEntry) {
-  if (Array.isArray(meal.analysis?.ingredients) && meal.analysis.ingredients.length > 0) {
-    return meal.analysis.ingredients;
-  }
-
-  if (Array.isArray(meal.ingredients) && meal.ingredients.length > 0) {
-    return meal.ingredients;
-  }
-
-  return [];
-}
-
-function formatQuantity(value: unknown) {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  const numeric = normalizeNumber(value);
-  if (numeric !== undefined) return `${numeric} גרם`;
-  return "לא זמין";
-}
-
-function formatMacro(value: unknown) {
-  const numeric = normalizeNumber(value);
-  return numeric !== undefined ? `${numeric} גרם` : "לא זמין";
-}
-
-function formatCalories(value: unknown) {
-  const numeric = normalizeNumber(value);
-  return numeric !== undefined ? `${numeric} קל׳` : "לא זמין";
-}
-
 function extractEstimatedCalories(meal: MealEntry) {
-  const structuredCalories =
-    normalizeNumber(meal.analysis?.totalCalories) ?? normalizeNumber(meal.totalCalories);
-
-  if (structuredCalories !== undefined) return structuredCalories;
-
-  return extractEstimatedCaloriesFromText(meal.analysisText || "");
+  return normalizeMealRecordForDisplay(meal).totalCalories || extractEstimatedCaloriesFromText(meal.analysisText || "");
 }
 
 function extractMealTitle(meal: MealEntry, fallbackLabel: string) {
@@ -420,18 +718,18 @@ function extractDetailsLinesFromText(text = "") {
 
       const name = parts[0] ?? "מרכיב";
       const quantity =
-        parts.find((p) => p.includes("כמות")) ?? "כמות: לא זמין";
+        parts.find((p) => p.includes("כמות")) ?? "כמות משוערת: כמות משוערת לא ידועה";
       const carbs =
-        parts.find((p) => p.includes("פחמימות")) ?? "פחמימות: לא זמין";
+        parts.find((p) => p.includes("פחמימות")) ?? "פחמימות: לא ניתן להעריך מהתמונה";
       const fat =
         parts.find((p) => p.includes("שומן") || p.includes("שומנים")) ??
-        "שומנים: לא זמין";
+        "שומנים: לא ניתן להעריך מהתמונה";
       const protein =
         parts.find((p) => p.includes("חלבון") || p.includes("חלבונים")) ??
-        "חלבונים: לא זמין";
+        "חלבונים: לא ניתן להעריך מהתמונה";
       const calories =
         parts.find((p) => p.includes("קלוריות") || p.includes("קל׳")) ??
-        "קלוריות: לא זמין";
+        "קלוריות: לא ניתן להעריך מהתמונה";
 
       return `${name}
 ${quantity}
@@ -448,27 +746,18 @@ ${calories}`;
 }
 
 function extractDetailsLines(meal: MealEntry) {
-  const structuredIngredients = getStructuredIngredients(meal);
+  const structuredIngredients = normalizeMealRecordForDisplay(meal).ingredients;
 
   if (structuredIngredients.length > 0) {
     return structuredIngredients.map((ingredient) => {
-      const name = valueOrMissing(
-        getIngredientField(ingredient, ["name", "foodName", "ingredientName"])
-      );
-      const quantity = formatQuantity(
-        getIngredientField(ingredient, ["quantity", "amount", "grams"])
-      );
-      const carbs = formatMacro(
-        getIngredientField(ingredient, ["carbs", "carbohydrates"])
-      );
-      const fat = formatMacro(getIngredientField(ingredient, ["fat", "fats"]));
-      const protein = formatMacro(getIngredientField(ingredient, ["protein"]));
-      const calories = formatCalories(
-        getIngredientField(ingredient, ["calories", "kcal"])
-      );
+      const quantity = formatEstimatedQuantityDisplay(ingredient);
+      const carbs = formatEstimatedNumericDisplay(ingredient.carbohydratesGrams, " גרם");
+      const fat = formatEstimatedNumericDisplay(ingredient.fatGrams, " גרם");
+      const protein = formatEstimatedNumericDisplay(ingredient.proteinGrams, " גרם");
+      const calories = formatEstimatedNumericDisplay(ingredient.calories, " קל׳");
 
-      return `שם המאכל: ${String(name)}
-כמות: ${quantity}
+      return `שם המאכל: ${String(ingredient.name)}
+כמות משוערת: ${quantity}
 פחמימות: ${carbs} | שומנים: ${fat} | חלבונים: ${protein}
 קלוריות: ${calories}`;
     });
@@ -530,6 +819,12 @@ export default function MealCategoryScreen() {
   const [mealsPermissionDenied, setMealsPermissionDenied] = useState(false);
   const [favoriteStateByMealId, setFavoriteStateByMealId] = useState<Record<string, boolean>>({});
   const [savingFavoriteIds, setSavingFavoriteIds] = useState<Record<string, boolean>>({});
+  const [editingMealId, setEditingMealId] = useState<string | null>(null);
+  const [mealEditDraft, setMealEditDraft] = useState<any | null>(null);
+  const [mealEditValidationErrors, setMealEditValidationErrors] = useState<string[]>([]);
+  const [mealEditSaveError, setMealEditSaveError] = useState<string | null>(null);
+  const [mealEditSuccessMessage, setMealEditSuccessMessage] = useState<string | null>(null);
+  const [isSavingMealEdit, setIsSavingMealEdit] = useState(false);
 
   const selectedDate = useMemo(() => {
     return parseDateKey(searchParams.get("date"));
@@ -646,6 +941,144 @@ export default function MealCategoryScreen() {
     );
   }, [filteredMeals]);
 
+  const closeMealEditModal = useCallback(() => {
+    setEditingMealId(null);
+    setMealEditDraft(null);
+    setMealEditValidationErrors([]);
+    setMealEditSaveError(null);
+  }, []);
+
+  const openMealEditModal = useCallback((meal: MealEntry, title: string) => {
+    const draft = normalizeMealForEdit(meal, title, meal.mealType || "lunch");
+    setEditingMealId(meal.id);
+    setMealEditDraft(draft);
+    setMealEditValidationErrors([]);
+    setMealEditSaveError(null);
+    console.log("MEAL EDIT OPENED", { mealId: meal.id });
+  }, []);
+
+  const handleRecalculateFromIngredients = useCallback(() => {
+    setMealEditDraft((previous: any) => {
+      if (!previous) return previous;
+
+      const totals = recalculateTotalsFromIngredients(previous.ingredients || []);
+      if (!totals.hasAny) return previous;
+
+      return {
+        ...previous,
+        totalCalories: totals.totalCalories,
+        totalProteinGrams: totals.totalProteinGrams,
+        totalCarbohydratesGrams: totals.totalCarbohydratesGrams,
+        totalFatGrams: totals.totalFatGrams,
+      };
+    });
+  }, []);
+
+  const handleSaveMealEdit = useCallback(async () => {
+    if (!editingMealId || !mealEditDraft) return;
+
+    const validationResult = validateMealEditDraft(mealEditDraft);
+    if (validationResult.mismatchWarning) {
+      console.log("MEAL EDIT VALIDATION WARNING", {
+        mealId: editingMealId,
+        warningCode: "MACRO_CALORIE_MISMATCH",
+      });
+    }
+
+    if (!validationResult.ok) {
+      setMealEditValidationErrors(validationResult.errors);
+      setMealEditSaveError(validationResult.errors[0] || "יש לתקן את השדות המסומנים לפני שמירה.");
+      console.log("MEAL EDIT VALIDATION FAILED", {
+        mealId: editingMealId,
+        errorsCount: validationResult.errors.length,
+      });
+      return;
+    }
+
+    setMealEditValidationErrors([]);
+    setMealEditSaveError(null);
+    setIsSavingMealEdit(true);
+    console.log("MEAL EDIT SAVE STARTED", { mealId: editingMealId });
+
+    try {
+      const payload = buildCanonicalMealUpdatePayload(validationResult.draft);
+      const response = await updateDiaryMeal(editingMealId, payload);
+      const updatedMeal = response?.meal && typeof response.meal === "object"
+        ? response.meal
+        : {};
+
+      setEntries((previous) => {
+        const previousCount = previous.length;
+        const hasTargetMeal = previous.some((meal) => meal.id === editingMealId);
+
+        console.log("MEAL EDIT LOCAL UPDATE STARTED", {
+          mealId: editingMealId,
+          previousMealCount: previousCount,
+          selectedCategory: mealType,
+          selectedDate: selectedDate.toISOString().slice(0, 10),
+        });
+
+        if (!hasTargetMeal) {
+          console.log("MEAL EDIT LOCAL UPDATE FAILED", {
+            mealId: editingMealId,
+            previousMealCount: previousCount,
+            nextMealCount: previousCount,
+            selectedCategory: mealType,
+            selectedDate: selectedDate.toISOString().slice(0, 10),
+          });
+          return previous;
+        }
+
+        const mergedPatch = {
+          ...payload,
+          ...updatedMeal,
+        };
+
+        const next = applyMealUpdateLocally(previous, editingMealId, mergedPatch);
+
+        console.log("MEAL EDIT LOCAL UPDATE APPLIED", {
+          mealId: editingMealId,
+          previousMealCount: previousCount,
+          nextMealCount: next.length,
+          selectedCategory: mealType,
+          selectedDate: selectedDate.toISOString().slice(0, 10),
+        });
+
+        return next;
+      });
+      closeMealEditModal();
+      setMealEditSuccessMessage("הארוחה עודכנה בהצלחה");
+      setTimeout(() => setMealEditSuccessMessage(null), 3000);
+      console.log("MEAL EDIT SAVED", { mealId: editingMealId });
+    } catch (error) {
+      const status = typeof (error as { status?: unknown })?.status === "number"
+        ? (error as { status?: number }).status
+        : null;
+      const code = String((error as { code?: unknown })?.code || "UNKNOWN").trim() || "UNKNOWN";
+      const message = error instanceof Error && error.message.trim()
+        ? error.message.trim()
+        : "שמירת העריכה נכשלה.";
+
+      console.log("MEAL EDIT PATCH FAILED", {
+        mealId: editingMealId,
+        status,
+        code,
+      });
+      console.log("MEAL EDIT FAILED", {
+        mealId: editingMealId,
+        message,
+      });
+      setMealEditSaveError(message);
+    } finally {
+      setIsSavingMealEdit(false);
+    }
+  }, [closeMealEditModal, editingMealId, mealEditDraft, mealType, selectedDate]);
+
+  const mealEditMismatchWarning = useMemo(() => {
+    if (!mealEditDraft) return null;
+    return getMacroMismatchWarning(mealEditDraft);
+  }, [mealEditDraft]);
+
   if (!mealType || !mealLabels[mealType]) {
     return (
       <div dir="rtl" className="min-h-screen bg-cream px-6 py-8">
@@ -671,6 +1104,12 @@ export default function MealCategoryScreen() {
         {mealsPermissionDenied && (
           <div className="mx-4 mt-3 rounded-2xl border border-orange/30 bg-white px-4 py-3 text-center text-sm font-semibold text-orange">
             אין הרשאה לטעון את הארוחות מהשרת כרגע. נסי להתחבר מחדש.
+          </div>
+        )}
+
+        {mealEditSuccessMessage && (
+          <div className="mx-4 mt-3 rounded-2xl bg-orange px-4 py-3 text-center text-sm font-semibold text-white">
+            {mealEditSuccessMessage}
           </div>
         )}
 
@@ -707,6 +1146,7 @@ export default function MealCategoryScreen() {
                       details={detailsLines}
                       isFavorited={isFavorited}
                       isSavingFavorite={isSavingFavorite}
+                      onEditClick={() => openMealEditModal(meal, title)}
                       onFavoriteClick={() => {
                         const userId = auth.currentUser?.uid;
                         if (!userId || isFavorited || isSavingFavorite) return;
@@ -715,18 +1155,17 @@ export default function MealCategoryScreen() {
 
                         void (async () => {
                           try {
-                            const protein = normalizeNumber(meal.analysis?.protein) ?? normalizeNumber(meal.protein);
-                            const carbs = normalizeNumber(meal.analysis?.carbs) ?? normalizeNumber(meal.carbs);
-                            const fat = normalizeNumber(meal.analysis?.fat) ?? normalizeNumber(meal.fat);
+                            const normalizedMeal = normalizeMealRecordForDisplay(meal);
 
                             await addFavorite(userId, {
                               name: title,
                               calories,
                               imageUrl: meal.imageUrl ?? undefined,
                               source: "saved_from_meal",
-                              ...(protein != null ? { protein } : {}),
-                              ...(carbs != null ? { carbs } : {}),
-                              ...(fat != null ? { fat } : {}),
+                              ingredients: normalizedMeal.ingredients,
+                              ...(normalizedMeal.totalProteinGrams != null ? { protein: normalizedMeal.totalProteinGrams } : {}),
+                              ...(normalizedMeal.totalCarbohydratesGrams != null ? { carbs: normalizedMeal.totalCarbohydratesGrams } : {}),
+                              ...(normalizedMeal.totalFatGrams != null ? { fat: normalizedMeal.totalFatGrams } : {}),
                             });
 
                             setFavoriteStateByMealId((prev) => ({
@@ -760,6 +1199,22 @@ export default function MealCategoryScreen() {
           </div>
         )}
       </div>
+
+      {editingMealId && mealEditDraft && (
+        <MealEditModal
+          mealDraft={mealEditDraft}
+          setMealDraft={setMealEditDraft}
+          validationErrors={mealEditValidationErrors}
+          saveError={mealEditSaveError}
+          isSaving={isSavingMealEdit}
+          mismatchWarning={mealEditMismatchWarning}
+          onRecalculate={handleRecalculateFromIngredients}
+          onCancel={closeMealEditModal}
+          onSave={() => {
+            void handleSaveMealEdit();
+          }}
+        />
+      )}
     </div>
   );
 }

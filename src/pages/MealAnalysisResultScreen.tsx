@@ -5,6 +5,11 @@ import { auth } from "../firebase.js";
 import { saveAnalyzedMealToDiary, toAbsoluteUploadUrl } from "../utils/mealsApi.js";
 import { addFavorite, isMealFavorited } from "../utils/favoritesApi.js";
 import type { AnalyzeMealResponse, MealType } from "../types/mealAnalysis.js";
+import {
+  formatEstimatedNumericDisplay,
+  formatEstimatedQuantityDisplay,
+  normalizeMealAnalysis,
+} from "../../shared/meal-analysis.js";
 
 type LocationState = {
   analysisResult?: AnalyzeMealResponse;
@@ -17,39 +22,6 @@ const mealTypeOptions: { value: MealType; label: string }[] = [
   { value: "dinner", label: "ארוחת ערב" },
   { value: "snack", label: "ארוחת ביניים" },
 ];
-
-const valueOrMissing = (value: unknown) => value ?? "לא זמין";
-
-function normalizeNumber(value: unknown) {
-  if (value === null || value === undefined || value === "") return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function getIngredientField(ingredient: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = ingredient[key];
-    if (value !== undefined && value !== null && value !== "") return value;
-  }
-  return undefined;
-}
-
-function formatQuantity(value: unknown) {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  const numeric = normalizeNumber(value);
-  if (numeric !== undefined) return `${numeric} גרם`;
-  return "לא זמין";
-}
-
-function formatMacro(value: unknown) {
-  const numeric = normalizeNumber(value);
-  return numeric !== undefined ? `${numeric} גרם` : "לא זמין";
-}
-
-function formatCalories(value: unknown) {
-  const numeric = normalizeNumber(value);
-  return numeric !== undefined ? `${numeric} קל׳` : "לא זמין";
-}
 
 export default function MealAnalysisResultScreen() {
   const navigate = useNavigate();
@@ -64,6 +36,10 @@ export default function MealAnalysisResultScreen() {
   const [isSavingFavorite, setIsSavingFavorite] = useState(false);
 
   const analysisResult = state?.analysisResult;
+  const normalizedAnalysis = useMemo(
+    () => normalizeMealAnalysis(analysisResult?.analysis || {}),
+    [analysisResult?.analysis],
+  );
 
   const absoluteImageUrl = useMemo(() => {
     if (!analysisResult?.imageUrl) return "";
@@ -83,8 +59,8 @@ export default function MealAnalysisResultScreen() {
       try {
         const exists = await isMealFavorited(
           userId,
-          analysisResult.analysis.mealName,
-          analysisResult.analysis.totalCalories,
+          normalizedAnalysis.mealName,
+          normalizedAnalysis.totalCalories,
         );
         if (!cancelled) setIsFavorited(exists);
       } catch (error) {
@@ -134,19 +110,19 @@ export default function MealAnalysisResultScreen() {
       const diaryPayload = {
         userId,
         mealType: selectedMealType,
-        mealName: analysisResult.analysis.mealName,
+        mealName: normalizedAnalysis.mealName,
         imageUrl: toAbsoluteUploadUrl(analysisResult.imageUrl),
-        ingredients: analysisResult.analysis.ingredients,
-        totalCalories: analysisResult.analysis.totalCalories,
+        ingredients: normalizedAnalysis.ingredients,
+        totalCalories: normalizedAnalysis.totalCalories,
         date: new Date().toISOString(),
-        ...(analysisResult.analysis.protein != null
-          ? { protein: analysisResult.analysis.protein }
+        ...(normalizedAnalysis.totalProteinGrams != null
+          ? { protein: normalizedAnalysis.totalProteinGrams }
           : {}),
-        ...(analysisResult.analysis.carbs != null
-          ? { carbs: analysisResult.analysis.carbs }
+        ...(normalizedAnalysis.totalCarbohydratesGrams != null
+          ? { carbs: normalizedAnalysis.totalCarbohydratesGrams }
           : {}),
-        ...(analysisResult.analysis.fat != null
-          ? { fat: analysisResult.analysis.fat }
+        ...(normalizedAnalysis.totalFatGrams != null
+          ? { fat: normalizedAnalysis.totalFatGrams }
           : {}),
       };
 
@@ -188,7 +164,7 @@ export default function MealAnalysisResultScreen() {
           <div className="overflow-hidden rounded-2xl shadow-md">
             <img
               src={absoluteImageUrl}
-              alt={analysisResult.analysis.mealName}
+              alt={normalizedAnalysis.mealName}
               className="h-64 w-full object-cover sm:h-80"
             />
           </div>
@@ -196,7 +172,7 @@ export default function MealAnalysisResultScreen() {
           <div className="mt-6 overflow-hidden rounded-3xl border border-brown bg-white text-right shadow-[0_14px_30px_rgba(0,0,0,0.08)]">
             <div className="flex items-center justify-between border-b border-brown px-5 py-4">
               <div className="flex items-center gap-4 text-orange">
-                <h2 className="text-xl font-bold text-black">{analysisResult.analysis.mealName}</h2>
+                <h2 className="text-xl font-bold text-black">{normalizedAnalysis.mealName}</h2>
                 <button type="button" aria-label="עריכה">
                   <Pencil className="h-7 w-7" />
                 </button>
@@ -211,18 +187,18 @@ export default function MealAnalysisResultScreen() {
                     try {
                       await addFavorite(userId, {
                         name: analysisResult.analysis.mealName,
-                        calories: analysisResult.analysis.totalCalories,
+                        calories: normalizedAnalysis.totalCalories,
                         imageUrl: toAbsoluteUploadUrl(analysisResult.imageUrl),
                         source: "saved_from_meal",
-                        ingredients: analysisResult.analysis.ingredients,
-                        ...(analysisResult.analysis.protein != null
-                          ? { protein: analysisResult.analysis.protein }
+                        ingredients: normalizedAnalysis.ingredients,
+                        ...(normalizedAnalysis.totalProteinGrams != null
+                          ? { protein: normalizedAnalysis.totalProteinGrams }
                           : {}),
-                        ...(analysisResult.analysis.carbs != null
-                          ? { carbs: analysisResult.analysis.carbs }
+                        ...(normalizedAnalysis.totalCarbohydratesGrams != null
+                          ? { carbs: normalizedAnalysis.totalCarbohydratesGrams }
                           : {}),
-                        ...(analysisResult.analysis.fat != null
-                          ? { fat: analysisResult.analysis.fat }
+                        ...(normalizedAnalysis.totalFatGrams != null
+                          ? { fat: normalizedAnalysis.totalFatGrams }
                           : {}),
                       });
                       setIsFavorited(true);
@@ -246,35 +222,20 @@ export default function MealAnalysisResultScreen() {
               <div>
                 <h3 className="mb-2 text-lg font-bold text-dark">רכיבים שזוהו</h3>
                 <div className="space-y-4">
-                  {analysisResult.analysis.ingredients.map((ingredient, index) => {
-                    const ingredientData = ingredient as Record<string, unknown>;
-
-                    const name = valueOrMissing(
-                      getIngredientField(ingredientData, ["name", "foodName", "ingredientName"]) ?? "מרכיב"
-                    );
-                    const quantity = formatQuantity(
-                      getIngredientField(ingredientData, ["quantity", "amount", "grams"])
-                    );
-                    const calories = formatCalories(
-                      getIngredientField(ingredientData, ["calories", "kcal"])
-                    );
-                    const protein = formatMacro(
-                      getIngredientField(ingredientData, ["protein"])
-                    );
-                    const carbs = formatMacro(
-                      getIngredientField(ingredientData, ["carbs", "carbohydrates"])
-                    );
-                    const fat = formatMacro(
-                      getIngredientField(ingredientData, ["fat", "fats"])
-                    );
+                  {normalizedAnalysis.ingredients.map((ingredient, index) => {
+                    const quantity = formatEstimatedQuantityDisplay(ingredient);
+                    const calories = formatEstimatedNumericDisplay(ingredient.calories, " קל׳");
+                    const protein = formatEstimatedNumericDisplay(ingredient.proteinGrams, " גרם");
+                    const carbs = formatEstimatedNumericDisplay(ingredient.carbohydratesGrams, " גרם");
+                    const fat = formatEstimatedNumericDisplay(ingredient.fatGrams, " גרם");
 
                     return (
                       <div
-                        key={`${String(name)}-${index}`}
+                        key={`${String(ingredient.name)}-${index}`}
                         className="rounded-2xl border border-orange-200 bg-white/90 p-4 text-right shadow-sm"
                       >
-                        <h3 className="text-xl font-bold text-gray-800">{String(name)}</h3>
-                        <p className="mt-2 text-base text-gray-600">כמות: {quantity}</p>
+                        <h3 className="text-xl font-bold text-gray-800">{ingredient.name}</h3>
+                        <p className="mt-2 text-base text-gray-600">כמות משוערת: {quantity}</p>
                         <p className="mt-2 text-base leading-7 text-gray-700">
                           פחמימות: {carbs} | שומנים: {fat} | חלבונים: {protein}
                         </p>
@@ -286,16 +247,21 @@ export default function MealAnalysisResultScreen() {
               </div>
 
               <div className="rounded-xl bg-[#F5EEE4] px-4 py-3 text-base text-dark">
-                <p className="text-lg font-bold text-orange">סה״כ: {analysisResult.analysis.totalCalories} קל׳</p>
-                {(analysisResult.analysis.protein != null ||
-                  analysisResult.analysis.carbs != null ||
-                  analysisResult.analysis.fat != null) && (
+                <p className="text-lg font-bold text-orange">הערכה תזונתית: {normalizedAnalysis.totalCalories} קל׳</p>
+                {(normalizedAnalysis.totalProteinGrams != null ||
+                  normalizedAnalysis.totalCarbohydratesGrams != null ||
+                  normalizedAnalysis.totalFatGrams != null) && (
                   <div className="mt-2 flex flex-wrap gap-4 text-sm">
-                    {analysisResult.analysis.protein != null && <span>חלבון: {analysisResult.analysis.protein} גרם</span>}
-                    {analysisResult.analysis.carbs != null && <span>פחמימות: {analysisResult.analysis.carbs} גרם</span>}
-                    {analysisResult.analysis.fat != null && <span>שומן: {analysisResult.analysis.fat} גרם</span>}
+                    <span>חלבון: {formatEstimatedNumericDisplay(normalizedAnalysis.totalProteinGrams, " גרם")}</span>
+                    <span>פחמימות: {formatEstimatedNumericDisplay(normalizedAnalysis.totalCarbohydratesGrams, " גרם")}</span>
+                    <span>שומן: {formatEstimatedNumericDisplay(normalizedAnalysis.totalFatGrams, " גרם")}</span>
                   </div>
                 )}
+                {normalizedAnalysis.estimationNotes?.length ? (
+                  <p className="mt-2 text-sm text-placeholder">
+                    {normalizedAnalysis.estimationNotes.join(" | ")}
+                  </p>
+                ) : null}
               </div>
 
               <div>

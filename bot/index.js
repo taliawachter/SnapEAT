@@ -12,16 +12,32 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
 } from "@whiskeysockets/baileys";
+import { getAuth } from "firebase-admin/auth";
+import { FieldValue } from "firebase-admin/firestore";
 import qrcode from "qrcode-terminal";
 import OpenAI from "openai";
 import { fileURLToPath } from "url";
-import { analyzeMealImage } from "./services/meal-analysis.js";
+import {
+  analyzeMealDataUrl,
+  analyzeMealImage,
+  repairMealAnalysisFromClarification,
+} from "./services/meal-analysis.js";
 import {
   MEMORY_CATEGORIES,
   mergeLongTermMemoryPatch,
   sanitizeMemoryPatch,
   sanitizeProfileForMemoryUpdate,
 } from "./services/memory-update/merge.helper.js";
+import {
+  canonicalAnalysisToLegacyText,
+  mealAnalysisNeedsClarification,
+  normalizeMealAnalysis,
+} from "../shared/meal-analysis.js";
+import {
+  buildCanonicalMealUpdatePayload,
+  extractBearerToken,
+  validateMealEditDraft,
+} from "../shared/meal-edit.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -893,22 +909,6 @@ async function maybeCreateConversationSummary(phone) {
   }
 }
 
-function resolveSenderJid(msg) {
-  const key = msg?.key || {};
-  const remoteJid = String(key.remoteJid || "");
-  const participant = String(key.participant || "");
-  const participantAlt = String(
-    key.participantAlt || key.participantPn || key.participantLid || msg?.participantAlt || ""
-  );
-
-  if (remoteJid.endsWith("@lid")) {
-    if (participantAlt) return participantAlt;
-    if (participant) return participant;
-  }
-
-  return remoteJid;
-}
-
 function isPnJid(jid = "") {
   return String(jid).endsWith("@s.whatsapp.net");
 }
@@ -983,72 +983,81 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-function normalizeOptionalNumber(value) {
-  if (value === null || value === undefined || value === "") return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
 function normalizeIngredientForStorage(item = {}) {
-  const name = String(item?.name || item?.foodName || item?.ingredientName || "רכיב");
-
-  const quantityRaw =
-    item?.quantity ??
-    item?.amount ??
-    (item?.grams !== null && item?.grams !== undefined && item?.grams !== ""
-      ? `${item.grams} גרם`
-      : undefined);
-
-  const quantity = typeof quantityRaw === "string" && quantityRaw.trim()
-    ? quantityRaw.trim()
-    : "לא צוין";
-
-  const calories = Number(item?.calories ?? item?.kcal ?? 0);
-  const protein = Number(item?.protein ?? 0);
-  const carbs = Number(item?.carbs ?? item?.carbohydrates ?? 0);
-  const fat = Number(item?.fat ?? item?.fats ?? 0);
-
+  const normalized = normalizeMealAnalysis({ ingredients: [item] }).ingredients[0];
   return {
-    name,
-    quantity,
-    calories: Number.isFinite(calories) ? calories : 0,
-    protein: Number.isFinite(protein) ? protein : 0,
-    carbs: Number.isFinite(carbs) ? carbs : 0,
-    fat: Number.isFinite(fat) ? fat : 0,
+    name: normalized.name,
+    estimatedQuantity: normalized.estimatedQuantity,
+    estimatedQuantityGrams: normalized.estimatedQuantityGrams,
+    calories: normalized.calories,
+    proteinGrams: normalized.proteinGrams,
+    carbohydratesGrams: normalized.carbohydratesGrams,
+    fatGrams: normalized.fatGrams,
+    confidence: normalized.confidence,
+    quantity: normalized.estimatedQuantity,
+    grams: normalized.estimatedQuantityGrams,
+    protein: normalized.proteinGrams,
+    carbs: normalized.carbohydratesGrams,
+    fat: normalized.fatGrams,
   };
 }
 
-function formatAnalysisText({ mealName, ingredients, totalCalories, protein, carbs, fat }) {
-  const ingredientLines = (ingredients || []).map((item) => {
-    const ingredientName = String(item?.name || "רכיב");
-    const quantity = String(item?.quantity || "לא צוין");
-    const ingredientCalories = Number(item?.calories || 0);
-    const ingredientCarbs = Number(item?.carbs || 0);
-    const ingredientFat = Number(item?.fat || 0);
-    const ingredientProtein = Number(item?.protein || 0);
-
-    return `${ingredientName} | כמות: ${quantity} | פחמימות: ${ingredientCarbs} גרם | שומנים: ${ingredientFat} גרם | חלבונים: ${ingredientProtein} גרם | קלוריות: ${ingredientCalories} קל׳`;
+function buildStoredMealEntry({
+  mealType,
+  mealName,
+  imageUrl,
+  analysis,
+  date,
+  source,
+  mealNote = "",
+  phone = undefined,
+}) {
+  const normalizedAnalysis = normalizeMealAnalysis({
+    ...analysis,
+    mealName: mealName || analysis?.mealName,
   });
+  const normalizedIngredients = normalizedAnalysis.ingredients.map((item) => normalizeIngredientForStorage(item));
 
-  const lines = [
-    `זיהיתי: ${mealName}`,
-    "",
-    "רכיבים מפורטים:",
-    ...ingredientLines,
-    "",
-    "קלוריות משוערות:",
-    `הערכה סבירה: ${totalCalories}`,
-    "",
-    "מאקרו משוער:",
-  ];
+  const entry = {
+    mealType,
+    mealName: normalizedAnalysis.mealName,
+    imageUrl: String(imageUrl || ""),
+    ingredients: normalizedIngredients,
+    totalCalories: normalizedAnalysis.totalCalories,
+    totalEstimatedQuantityGrams: normalizedAnalysis.totalEstimatedQuantityGrams,
+    analysis: {
+      mealName: normalizedAnalysis.mealName,
+      description: normalizedAnalysis.description,
+      totalEstimatedQuantityGrams: normalizedAnalysis.totalEstimatedQuantityGrams,
+      totalCalories: normalizedAnalysis.totalCalories,
+      totalProteinGrams: normalizedAnalysis.totalProteinGrams,
+      totalCarbohydratesGrams: normalizedAnalysis.totalCarbohydratesGrams,
+      totalFatGrams: normalizedAnalysis.totalFatGrams,
+      confidence: normalizedAnalysis.confidence,
+      estimationNotes: normalizedAnalysis.estimationNotes,
+      ingredients: normalizedIngredients,
+      protein: normalizedAnalysis.totalProteinGrams,
+      carbs: normalizedAnalysis.totalCarbohydratesGrams,
+      fat: normalizedAnalysis.totalFatGrams,
+    },
+    analysisText: canonicalAnalysisToLegacyText(normalizedAnalysis),
+    createdAt: date ? new Date(date) : new Date(),
+    source,
+  };
 
-  if (protein !== undefined) lines.push(`חלבון: ${protein}`);
-  if (carbs !== undefined) lines.push(`פחמימות: ${carbs}`);
-  if (fat !== undefined) lines.push(`שומן: ${fat}`);
+  if (mealNote) entry.mealNote = mealNote;
+  if (phone) entry.phone = phone;
+  if (normalizedAnalysis.totalProteinGrams !== null && normalizedAnalysis.totalProteinGrams !== undefined) {
+    entry.protein = normalizedAnalysis.totalProteinGrams;
+  }
+  if (normalizedAnalysis.totalCarbohydratesGrams !== null && normalizedAnalysis.totalCarbohydratesGrams !== undefined) {
+    entry.carbs = normalizedAnalysis.totalCarbohydratesGrams;
+  }
+  if (normalizedAnalysis.totalFatGrams !== null && normalizedAnalysis.totalFatGrams !== undefined) {
+    entry.fat = normalizedAnalysis.totalFatGrams;
+  }
 
-  lines.push(`סה״כ: ${totalCalories} קל׳`);
-
-  return lines.join("\n");
+  return entry;
 }
 
 function normalizeMealType(text = "") {
@@ -1109,7 +1118,7 @@ async function getUserByPhone(phone) {
 async function saveMealEntry({
   phone,
   mealNote = "",
-  analysisText = "",
+  analysis = null,
   imageUrl = null,
   mealType = "",
 }) {
@@ -1130,17 +1139,23 @@ async function saveMealEntry({
   const userRef = db.collection("users").doc(user.id);
 
   try {
-    await userRef.collection("meals").add({
-      mealNote,
-      analysisText,
-      imageUrl,
+    const entry = buildStoredMealEntry({
       mealType,
-      createdAt: new Date(),
+      mealName: analysis?.mealName,
+      imageUrl,
+      analysis,
       source: "whatsapp",
+      mealNote,
       phone,
     });
 
+    await userRef.collection("meals").add(entry);
+
     console.log("✅ ארוחה נשמרה עבור user:", user.id, "סוג:", mealType);
+    console.log("MEAL ANALYSIS SAVED", {
+      ingredientCount: Array.isArray(entry.ingredients) ? entry.ingredients.length : 0,
+      confidence: entry.analysis?.confidence ?? null,
+    });
     return true;
   } catch (error) {
     console.log("❌ שגיאה בשמירת ארוחה:", error?.message || error);
@@ -1171,12 +1186,18 @@ app.post("/api/meals/analyze", upload.single("mealImage"), async (req, res) => {
       imageUrl,
       analysis: {
         mealName: analysis.mealName,
+        description: analysis.description,
+        totalEstimatedQuantityGrams: analysis.totalEstimatedQuantityGrams,
         ingredients: analysis.ingredients,
         totalCalories: analysis.totalCalories,
-        protein: analysis.protein,
-        carbs: analysis.carbs,
-        fat: analysis.fat,
+        totalProteinGrams: analysis.totalProteinGrams,
+        totalCarbohydratesGrams: analysis.totalCarbohydratesGrams,
+        totalFatGrams: analysis.totalFatGrams,
         confidence: analysis.confidence,
+        estimationNotes: analysis.estimationNotes,
+        protein: analysis.totalProteinGrams,
+        carbs: analysis.totalCarbohydratesGrams,
+        fat: analysis.totalFatGrams,
       },
     });
   } catch (error) {
@@ -1216,64 +1237,28 @@ app.post("/api/diary/meals", async (req, res) => {
       return;
     }
 
-    const normalizedIngredients = ingredients.map((item) => normalizeIngredientForStorage(item));
-
-    const normalizedTotalCalories = Number(totalCalories || 0);
-    const normalizedProtein = normalizeOptionalNumber(protein);
-    const normalizedCarbs = normalizeOptionalNumber(carbs);
-    const normalizedFat = normalizeOptionalNumber(fat);
-
-    const computedTotals = normalizedIngredients.reduce(
-      (acc, item) => {
-        acc.calories += Number(item.calories || 0);
-        acc.protein += Number(item.protein || 0);
-        acc.carbs += Number(item.carbs || 0);
-        acc.fat += Number(item.fat || 0);
-        return acc;
-      },
-      { calories: 0, protein: 0, carbs: 0, fat: 0 }
-    );
-
-    const finalCalories =
-      Number.isFinite(normalizedTotalCalories) && normalizedTotalCalories > 0
-        ? normalizedTotalCalories
-        : computedTotals.calories;
-
-    const finalProtein = normalizedProtein ?? computedTotals.protein;
-    const finalCarbs = normalizedCarbs ?? computedTotals.carbs;
-    const finalFat = normalizedFat ?? computedTotals.fat;
-
-    const entry = {
+    const entry = buildStoredMealEntry({
       mealType,
       mealName: String(mealName),
       imageUrl: String(imageUrl),
-      ingredients: normalizedIngredients,
-      totalCalories: finalCalories,
       analysis: {
         mealName: String(mealName),
-        ingredients: normalizedIngredients,
-        totalCalories: finalCalories,
-        protein: finalProtein,
-        carbs: finalCarbs,
-        fat: finalFat,
+        ingredients,
+        totalCalories,
+        totalProteinGrams: protein,
+        totalCarbohydratesGrams: carbs,
+        totalFatGrams: fat,
       },
-      analysisText: formatAnalysisText({
-        mealName: String(mealName),
-        ingredients: normalizedIngredients,
-        totalCalories: finalCalories,
-        protein: finalProtein,
-        carbs: finalCarbs,
-        fat: finalFat,
-      }),
-      createdAt: date ? new Date(date) : new Date(),
+      date,
       source: "app",
-    };
-
-    if (finalProtein !== undefined) entry.protein = finalProtein;
-    if (finalCarbs !== undefined) entry.carbs = finalCarbs;
-    if (finalFat !== undefined) entry.fat = finalFat;
+    });
 
     const savedDoc = await db.collection("users").doc(String(userId)).collection("meals").add(entry);
+
+    console.log("MEAL ANALYSIS SAVED", {
+      ingredientCount: Array.isArray(entry.ingredients) ? entry.ingredients.length : 0,
+      confidence: entry.analysis?.confidence ?? null,
+    });
 
     res.status(201).json({
       id: savedDoc.id,
@@ -1282,6 +1267,147 @@ app.post("/api/diary/meals", async (req, res) => {
   } catch (error) {
     console.log("❌ diary save endpoint failed:", error?.message || error);
     res.status(500).json({ error: "Failed to save meal in diary" });
+  }
+});
+
+async function getAuthenticatedUid(req) {
+  const token = extractBearerToken(req.headers?.authorization || "");
+  if (!token) return null;
+
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return decoded?.uid || null;
+  } catch {
+    return null;
+  }
+}
+
+function toExistingDateValue(value) {
+  if (value?.toDate && typeof value.toDate === "function") return value.toDate();
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return new Date();
+  return parsed;
+}
+
+function serializeTimestampForJson(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+
+  if (typeof value?.toDate === "function") {
+    const dateValue = value.toDate();
+    if (dateValue instanceof Date && !Number.isNaN(dateValue.getTime())) {
+      return dateValue.toISOString();
+    }
+  }
+
+  const seconds = Number(value?._seconds ?? value?.seconds);
+  if (Number.isFinite(seconds)) {
+    const nanos = Number(value?._nanoseconds ?? value?.nanoseconds ?? 0);
+    const parsed = new Date((seconds * 1000) + Math.floor(nanos / 1e6));
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+
+  return null;
+}
+
+app.patch("/api/diary/meals/:mealId", async (req, res) => {
+  try {
+    const uid = await getAuthenticatedUid(req);
+    if (!uid) {
+      res.status(401).json({ error: "נדרשת התחברות כדי לערוך ארוחה.", code: "UNAUTHORIZED" });
+      return;
+    }
+
+    const mealId = String(req.params?.mealId || "").trim();
+    if (!mealId) {
+      res.status(400).json({ error: "חסר מזהה ארוחה.", code: "MISSING_MEAL_ID" });
+      return;
+    }
+
+    const validationResult = validateMealEditDraft(req.body || {});
+    if (!validationResult.ok) {
+      res.status(400).json({
+        error: validationResult.errors[0] || "נתוני עריכה לא תקינים.",
+        code: "INVALID_MEAL_PAYLOAD",
+        details: validationResult.errors,
+      });
+      return;
+    }
+
+    const canonicalPayload = buildCanonicalMealUpdatePayload(validationResult.draft);
+    const mealRef = db.collection("users").doc(uid).collection("meals").doc(mealId);
+    const snapshot = await mealRef.get();
+
+    if (!snapshot.exists) {
+      res.status(404).json({ error: "הארוחה לא נמצאה.", code: "MEAL_NOT_FOUND" });
+      return;
+    }
+
+    const existing = snapshot.data() || {};
+    const rebuilt = buildStoredMealEntry({
+      mealType: canonicalPayload.mealType,
+      mealName: canonicalPayload.mealName,
+      imageUrl: existing.imageUrl || "",
+      analysis: {
+        mealName: canonicalPayload.mealName,
+        ingredients: canonicalPayload.ingredients,
+        totalCalories: canonicalPayload.totalCalories,
+        totalProteinGrams: canonicalPayload.totalProteinGrams,
+        totalCarbohydratesGrams: canonicalPayload.totalCarbohydratesGrams,
+        totalFatGrams: canonicalPayload.totalFatGrams,
+        totalEstimatedQuantityGrams: canonicalPayload.totalEstimatedQuantityGrams,
+      },
+      date: toExistingDateValue(existing.createdAt),
+      source: existing.source || "app",
+      mealNote: existing.mealNote || "",
+      phone: existing.phone,
+    });
+
+    const updatePayload = {
+      mealType: rebuilt.mealType,
+      mealName: rebuilt.mealName,
+      ingredients: rebuilt.ingredients,
+      totalCalories: rebuilt.totalCalories,
+      totalEstimatedQuantityGrams: rebuilt.totalEstimatedQuantityGrams,
+      analysis: rebuilt.analysis,
+      analysisText: rebuilt.analysisText,
+      protein: rebuilt.protein ?? null,
+      carbs: rebuilt.carbs ?? null,
+      fat: rebuilt.fat ?? null,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    await mealRef.set(updatePayload, { merge: true });
+
+    const updatedSnap = await mealRef.get();
+    const updatedData = updatedSnap.data() || {};
+
+    res.json({
+      success: true,
+      ok: true,
+      id: mealId,
+      meal: {
+        id: mealId,
+        ...updatedData,
+        imageUrl: String(updatedData.imageUrl || existing.imageUrl || rebuilt.imageUrl || ""),
+        createdAt: serializeTimestampForJson(updatedData.createdAt || existing.createdAt),
+        updatedAt: serializeTimestampForJson(updatedData.updatedAt),
+        source: updatedData.source || existing.source || "app",
+      },
+    });
+  } catch (error) {
+    console.log("MEAL EDIT PATCH FAILED", {
+      status: 500,
+      code: "PATCH_MEAL_FAILED",
+    });
+    console.log("❌ meal update endpoint failed:", error?.message || error);
+    res.status(500).json({ error: "עדכון הארוחה נכשל.", code: "PATCH_MEAL_FAILED" });
   }
 });
 
@@ -1373,11 +1499,6 @@ function shouldSkipAsStaleMessage(msg, type) {
   return isStaleInboundMessage(msg);
 }
 
-function getHistory(chatId) {
-  const h = memory.get(chatId) || [];
-  return h.slice(-10);
-}
-
 function addToHistory(chatId, role, content) {
   const h = memory.get(chatId) || [];
   h.push({ role, content });
@@ -1387,23 +1508,6 @@ function addToHistory(chatId, role, content) {
 // =====================
 // Helpers
 // =====================
-function isGreeting(text) {
-  const t = text.trim().toLowerCase();
-  const greetings = [
-    "היי",
-    "הי",
-    "שלום",
-    "הלו",
-    "אהלן",
-    "מה קורה",
-    "מה נשמע",
-    "hi",
-    "hello",
-    "hey",
-  ];
-  return greetings.includes(t);
-}
-
 function shouldIgnoreMessage(msg, type) {
   if (!msg) return true;
 
@@ -1436,79 +1540,31 @@ function shouldIgnoreMessage(msg, type) {
   return false;
 }
 
-function extractClarifyingQuestion(analysisText = "") {
-  const match = analysisText.match(/שאלת הבהרה:\s*([\s\S]*)/);
-  if (!match) return null;
-  return match[1].trim().split("\n")[0].trim();
-}
+function getFallbackClarifyingQuestionFromMealName(mealName = "") {
+  const text = String(mealName || "").toLowerCase();
 
-function sanitizeClarifyingQuestion(question = "") {
-  const q = question.trim();
-
-  const badPatterns = [
-    "מה הכמות",
-    "מהי הכמות",
-    "כמות מדויקת",
-    "הכמות המדויקת",
-    "כמה גרם",
-    "כמה מכל",
-    "כמה מכל רכיב",
-    "כמה מכל מרכיב",
-    "כמה רכיבים",
-    "מה הכמות המדויקת של כל",
-    "מה הכמות של כל",
-  ];
-
-  const isBad = badPatterns.some((pattern) => q.includes(pattern));
-
-  if (isBad || !q) {
-    return "האם היה במנה רוטב, שמן, גבינה, שמנת או טיגון?";
-  }
-
-  return q;
-}
-
-function getFallbackClarifyingQuestion(analysisText = "") {
-  const text = analysisText.toLowerCase();
-
-  if (text.includes("סלט")) {
-    return "האם היה רוטב, שמן או תוספות כמו קרוטונים וגבינה?";
-  }
-
-  if (text.includes("פסטה")) {
-    return "האם היה רוטב שמנת, שמן, גבינה או חמאה?";
-  }
-
-  if (
-    text.includes("טוסט") ||
-    text.includes("כריך") ||
-    text.includes("סנדוויץ")
-  ) {
+  if (text.includes("סלט")) return "האם היה רוטב, שמן או תוספות כמו קרוטונים וגבינה?";
+  if (text.includes("פסטה")) return "האם היה רוטב שמנת, שמן, גבינה או חמאה?";
+  if (text.includes("טוסט") || text.includes("כריך") || text.includes("סנדוויץ")) {
     return "האם היה רוטב, גבינה, חמאה או ממרח בתוך המנה?";
   }
-
-  if (
-    text.includes("שניצל") ||
-    text.includes("צ'יפס") ||
-    text.includes("מטוגן")
-  ) {
+  if (text.includes("שניצל") || text.includes("צ'יפס") || text.includes("מטוגן")) {
     return "האם זה היה מטוגן בשמן והאם אכלת את כל המנה?";
   }
-
-  if (text.includes("יוגורט") || text.includes("גרנולה")) {
-    return "האם היה דבש, סוכר, גרנולה או תוספות נוספות?";
+  if (text.includes("יוגורט") || text.includes("גרנולה") || text.includes("קוואקר")) {
+    return "הוספת חלב, יוגורט, דבש או תוספות נוספות?";
   }
 
-  return "האם היה במנה רוטב, שמן, גבינה, שמנת או טיגון?";
+  return "יש פרט שיכול לשנות משמעותית את ההערכה, למשל רוטב, שמן, גבינה או גודל מנה?";
 }
 
-function cleanAnalysisText(text = "") {
-  return text
-    .replace(/שאלת הבהרה:[\s\S]*/g, "")
-    .replace(/זהו ניתוח ראשוני של ארוחה:/g, "")
-    .replace(/זהו ניתוח ראשוני של תמונת אוכל:/g, "")
-    .replace(/This is a preliminary analysis of a food image:/gi, "")
-    .trim();
+function getClarificationQuestionFromAnalysis(analysis) {
+  const question = String(analysis?.clarificationQuestion || "").trim();
+  return question || getFallbackClarifyingQuestionFromMealName(analysis?.mealName);
+}
+
+function formatMealAnalysisForUser(analysis) {
+  return canonicalAnalysisToLegacyText(analysis);
 }
 
 // =====================
@@ -1612,101 +1668,6 @@ ${String(userText || "").trim()}
     shouldSaveMemory,
     memoryUpdate,
   };
-}
-
-async function estimateCaloriesFromImage(imageDataUrl, userNote = "") {
-  const prompt = `
-את תזונאית דיגיטלית חכמה שמנתחת תמונות אוכל.
-
-המטרה שלך:
-1. לזהות את האוכל
-2. לפרט את רכיבי המנה
-3. לתת לכל רכיב ערכים תזונתיים משוערים
-4. להעריך סה"כ קלוריות ומאקרו
-5. לשאול שאלה אחת קצרה שתשפר דיוק
-
-חוקים חשובים מאוד:
-- אסור לשאול על כמויות מדויקות של רכיבים.
-- אסור לשאול שאלות שהמשתמש/ת כנראה לא יודע/ת לענות עליהן.
-- מותר לשאול רק שאלות פשוטות ומעשיות, כמו:
-  - האם היה רוטב?
-  - האם היה שמן או חמאה?
-  - האם זה מטוגן, אפוי או מבושל?
-  - האם יש גבינה / שמנת / מיונז?
-  - האם אכלת את כל המנה או רק חלק?
-  - האם יש תוספת שלא רואים טוב בתמונה?
-- השאלה חייבת להיות קצרה מאוד, טבעית וברורה.
-- אם אין שאלה טובה במיוחד, שאלי:
-  "האם היה במנה רוטב, שמן, גבינה או טיגון?"
-
-החזירי בדיוק במבנה הזה:
-
-זיהיתי:
-[מה יש בתמונה]
-
-רכיבים מפורטים:
-[רכיב 1] | [קלוריות] | [חלבון] | [פחמימות] | [שומן] | [כמות/יחידות]
-[רכיב 2] | [קלוריות] | [חלבון] | [פחמימות] | [שומן] | [כמות/יחידות]
-
-קלוריות משוערות:
-[טווח]
-הערכה סבירה: [מספר אחד]
-
-מאקרו משוער:
-חלבון: [טווח]
-פחמימות: [טווח]
-שומן: [טווח]
-
-💡 תובנות:
-[2-3 משפטים קצרים על הארוחה]
-
-שאלת הבהרה:
-[שאלה אחת קצרה בלבד]
-
-${userNote ? `הערת המשתמש: ${userNote}` : "אין הערת משתמש."}
-`.trim();
-
-  const resp = await client.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.1,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: imageDataUrl } },
-        ],
-      },
-    ],
-  });
-
-  return (
-    resp.choices?.[0]?.message?.content?.trim() ||
-    "לא הצלחתי להעריך את הקלוריות מהתמונה. נסי לשלוח תמונה ברורה יותר 🙏"
-  );
-}
-
-async function refineMealAnalysis(originalAnalysis, clarificationAnswer) {
-  const prompt = `
-זהו ניתוח ראשוני של תמונת אוכל:
-${originalAnalysis}
-
-המשתמש/ת הוסיף/ה הבהרה:
-${clarificationAnswer}
-
-עדכני את הערכת הקלוריות והמאקרו לפי ההבהרה.
-כתבי בעברית טבעית, קצרה וברורה.
-שמרי על אותו מבנה תשובה של הניתוח המקורי, כולל "רכיבים מפורטים" עם ערכים לכל רכיב,
-אבל בלי "שאלת הבהרה" בסוף.
-`.trim();
-
-  const resp = await client.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.2,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  return resp.choices?.[0]?.message?.content?.trim() || originalAnalysis;
 }
 
 // =====================
@@ -1936,11 +1897,6 @@ async function startBot() {
 
       const from = msg.key.remoteJid;
 
-      console.log("msg.key.remoteJid:", msg?.key?.remoteJid);
-      console.log("msg.key.remoteJidAlt:", msg?.key?.remoteJidAlt);
-      console.log("msg.key.participant:", msg?.key?.participant);
-      console.log("msg.key.participantAlt:", msg?.key?.participantAlt);
-
       const resolvedPhone = await resolvePhoneFromMessageKey(msg, sock);
 
       if (!resolvedPhone) {
@@ -1976,6 +1932,11 @@ async function startBot() {
       try {
 
         if (imageMessage) {
+          console.log("MEAL ANALYSIS STARTED", {
+            ingredientCount: 0,
+            confidence: null,
+          });
+
           await sock.sendMessage(from, {
             text: "מנתחת את התמונה עכשיו, רגע 🙏",
           });
@@ -1993,12 +1954,12 @@ async function startBot() {
 
           addToHistory(resolvedPhone, "user", text ? `[תמונה] ${text}` : "[תמונה]");
 
-          const analysis = await estimateCaloriesFromImage(dataUrl, text);
-
-          const extractedQuestion = extractClarifyingQuestion(analysis);
-          const clarificationQuestion = sanitizeClarifyingQuestion(
-            extractedQuestion || getFallbackClarifyingQuestion(analysis)
-          );
+          const analysis = await analyzeMealDataUrl(dataUrl, text);
+          const shouldClarify = mealAnalysisNeedsClarification(analysis);
+          const clarificationQuestion = shouldClarify
+            ? getClarificationQuestionFromAnalysis(analysis)
+            : null;
+          const analysisText = formatMealAnalysisForUser(analysis);
 
           let uploadedImageUrl = null;
 
@@ -2013,21 +1974,35 @@ async function startBot() {
           }
 
           pending.set(from, {
-            step: "awaiting_clarification",
+            step: shouldClarify ? "awaiting_clarification" : "awaiting_meal_type",
             imageUrl: uploadedImageUrl,
-            analysisText: analysis,
+            analysis,
+            analysisText,
             mealNote: text || "",
             createdAt: Date.now(),
           });
 
-          await sock.sendMessage(from, {
-            text: `${cleanAnalysisText(analysis)}
+          if (shouldClarify && clarificationQuestion) {
+            await sock.sendMessage(from, {
+              text: `${analysisText}
 
 כדי לדייק יותר:
 ${clarificationQuestion}`,
-          });
+            });
+          } else {
+            await sock.sendMessage(from, {
+              text: `${analysisText}
 
-          addToHistory(resolvedPhone, "assistant", cleanAnalysisText(analysis));
+איזו ארוחה זו הייתה?
+כתבי רק אחת מהאפשרויות:
+בוקר
+צהריים
+ערב
+ביניים`,
+            });
+          }
+
+          addToHistory(resolvedPhone, "assistant", analysisText);
           return;
         }
 
@@ -2036,20 +2011,22 @@ ${clarificationQuestion}`,
           const p = pending.get(from);
 
           if (p?.step === "awaiting_clarification") {
-            const refinedAnalysis = await refineMealAnalysis(
-              p.analysisText,
+            const refinedAnalysis = await repairMealAnalysisFromClarification(
+              p.analysis,
               cleanText
             );
+            const refinedAnalysisText = formatMealAnalysisForUser(refinedAnalysis);
 
             pending.set(from, {
               ...p,
               step: "awaiting_meal_type",
-              analysisText: cleanAnalysisText(refinedAnalysis),
+              analysis: refinedAnalysis,
+              analysisText: refinedAnalysisText,
               mealNote: p.mealNote,
             });
 
             await sock.sendMessage(from, {
-              text: `${cleanAnalysisText(refinedAnalysis)}
+              text: `${refinedAnalysisText}
 
 איזו ארוחה זו הייתה?
 כתבי רק אחת מהאפשרויות:
@@ -2079,7 +2056,7 @@ ${clarificationQuestion}`,
             const saved = await saveMealEntry({
               phone: resolvedPhone,
               mealNote: p.mealNote,
-              analysisText: cleanAnalysisText(p.analysisText),
+              analysis: p.analysis,
               imageUrl: p.imageUrl,
               mealType,
             });

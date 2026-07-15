@@ -2,21 +2,34 @@ export type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 
 export type IngredientAnalysis = {
   name: string;
-  calories: number;
+  estimatedQuantity?: string | null;
+  estimatedQuantityGrams?: number | null;
+  calories?: number | null;
+  proteinGrams?: number | null;
+  carbohydratesGrams?: number | null;
+  fatGrams?: number | null;
+  confidence?: number;
   quantity?: string;
-  protein?: number;
-  carbs?: number;
-  fat?: number;
+  grams?: number | null;
+  protein?: number | null;
+  carbs?: number | null;
+  fat?: number | null;
 };
 
 export type MealAnalysis = {
   mealName: string;
+  description?: string;
+  totalEstimatedQuantityGrams?: number | null;
   ingredients: IngredientAnalysis[];
   totalCalories: number;
+  totalProteinGrams?: number;
+  totalCarbohydratesGrams?: number;
+  totalFatGrams?: number;
+  confidence?: number;
+  estimationNotes?: string[];
   protein?: number;
   carbs?: number;
   fat?: number;
-  confidence?: number;
 };
 
 export type AnalyzeMealResponse = {

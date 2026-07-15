@@ -15,6 +15,7 @@ import type { FirebaseError } from "firebase/app";
 import { auth, db } from "../firebase.js";
 import ProfileDrawer from "./ProfileDrawer.js";
 import BottomNavbar from "../components/BottomNavbar.js";
+import { normalizeMealRecordForDisplay } from "../../shared/meal-analysis.js";
 
 type TabKey = "daily" | "weekly" | "monthly";
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
@@ -22,6 +23,13 @@ type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 type MealEntry = {
   id: string;
   mealType?: MealType;
+  mealName?: string;
+  totalCalories?: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
+  ingredients?: Array<Record<string, unknown>>;
+  analysis?: Record<string, unknown>;
   mealNote?: string;
   analysisText?: string;
   createdAt?: any;
@@ -171,6 +179,26 @@ function extractMacro(text = "", label: string) {
   return match?.[1] ? Number(match[1]) : 0;
 }
 
+function extractMealCalories(entry: MealEntry) {
+  const normalized = normalizeMealRecordForDisplay(entry);
+  return normalized.totalCalories || extractEstimatedCalories(entry.analysisText || "");
+}
+
+function extractMealCarbs(entry: MealEntry) {
+  const normalized = normalizeMealRecordForDisplay(entry);
+  return normalized.totalCarbohydratesGrams || extractMacro(entry.analysisText || "", "פחמימות");
+}
+
+function extractMealProtein(entry: MealEntry) {
+  const normalized = normalizeMealRecordForDisplay(entry);
+  return normalized.totalProteinGrams || extractMacro(entry.analysisText || "", "חלבון");
+}
+
+function extractMealFat(entry: MealEntry) {
+  const normalized = normalizeMealRecordForDisplay(entry);
+  return normalized.totalFatGrams || extractMacro(entry.analysisText || "", "שומן");
+}
+
 function formatDateKey(date: Date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -187,19 +215,19 @@ function buildDailyMeals(entries: MealEntry[], selectedDate: Date): Meal[] {
     const items = dayEntries.filter((entry) => entry.mealType === mealType);
 
     const calories = items.reduce(
-      (sum, item) => sum + extractEstimatedCalories(item.analysisText || ""),
+      (sum, item) => sum + extractMealCalories(item),
       0
     );
     const carbs = items.reduce(
-      (sum, item) => sum + extractMacro(item.analysisText || "", "פחמימות"),
+      (sum, item) => sum + extractMealCarbs(item),
       0
     );
     const protein = items.reduce(
-      (sum, item) => sum + extractMacro(item.analysisText || "", "חלבון"),
+      (sum, item) => sum + extractMealProtein(item),
       0
     );
     const fat = items.reduce(
-      (sum, item) => sum + extractMacro(item.analysisText || "", "שומן"),
+      (sum, item) => sum + extractMealFat(item),
       0
     );
 
@@ -261,19 +289,19 @@ function buildWeeklyData(entries: MealEntry[], selectedDate: Date): PeriodData {
   });
 
   const calories = weekEntries.reduce(
-    (sum, item) => sum + extractEstimatedCalories(item.analysisText || ""),
+    (sum, item) => sum + extractMealCalories(item),
     0
   );
   const carbs = weekEntries.reduce(
-    (sum, item) => sum + extractMacro(item.analysisText || "", "פחמימות"),
+    (sum, item) => sum + extractMealCarbs(item),
     0
   );
   const protein = weekEntries.reduce(
-    (sum, item) => sum + extractMacro(item.analysisText || "", "חלבון"),
+    (sum, item) => sum + extractMealProtein(item),
     0
   );
   const fat = weekEntries.reduce(
-    (sum, item) => sum + extractMacro(item.analysisText || "", "שומן"),
+    (sum, item) => sum + extractMealFat(item),
     0
   );
 
@@ -287,7 +315,7 @@ function buildWeeklyData(entries: MealEntry[], selectedDate: Date): PeriodData {
     return weekEntries
       .filter((entry) => isSameDay(entry.createdAt, currentDate))
       .reduce(
-        (sum, item) => sum + extractEstimatedCalories(item.analysisText || ""),
+        (sum, item) => sum + extractMealCalories(item),
         0
       );
   });
@@ -319,19 +347,19 @@ function buildMonthlyData(entries: MealEntry[], selectedDate: Date): PeriodData 
   });
 
   const calories = monthEntries.reduce(
-    (sum, item) => sum + extractEstimatedCalories(item.analysisText || ""),
+    (sum, item) => sum + extractMealCalories(item),
     0
   );
   const carbs = monthEntries.reduce(
-    (sum, item) => sum + extractMacro(item.analysisText || "", "פחמימות"),
+    (sum, item) => sum + extractMealCarbs(item),
     0
   );
   const protein = monthEntries.reduce(
-    (sum, item) => sum + extractMacro(item.analysisText || "", "חלבון"),
+    (sum, item) => sum + extractMealProtein(item),
     0
   );
   const fat = monthEntries.reduce(
-    (sum, item) => sum + extractMacro(item.analysisText || "", "שומן"),
+    (sum, item) => sum + extractMealFat(item),
     0
   );
 
@@ -345,7 +373,7 @@ function buildMonthlyData(entries: MealEntry[], selectedDate: Date): PeriodData 
     const dayIndex = date.getDate() - 1;
     chartPoints[dayIndex] =
       (chartPoints[dayIndex] ?? 0) +
-      extractEstimatedCalories(item.analysisText || "");
+      extractMealCalories(item);
   });
 
   const chartLabels = Array.from({ length: daysInMonth }, (_, index) =>

@@ -1,6 +1,12 @@
 import fs from "fs";
 import path from "path";
 import OpenAI from "openai";
+import {
+  mealAnalysisNeedsClarification,
+  mealAnalysisNeedsRepair,
+  mergeMissingMealAnalysisFields,
+  normalizeMealAnalysis,
+} from "../../shared/meal-analysis.js";
 
 let _client = null;
 const DEBUG_MEAL_ANALYSIS = process.env.DEBUG_MEAL_ANALYSIS === "true";
@@ -20,83 +26,96 @@ function stripJsonCodeBlock(text = "") {
     .trim();
 }
 
-function normalizeIngredient(item) {
-  const qty = item?.quantity ?? item?.amount;
-  const grams = item?.grams;
+function parseJsonResponse(raw = "") {
+  const cleaned = stripJsonCodeBlock(raw);
+  if (!cleaned) return null;
 
-  const quantity =
-    (typeof qty === "string" && qty.trim())
-      ? qty.trim()
-      : (grams !== null && grams !== undefined && grams !== "")
-        ? `${Number(grams) || grams} גרם`
-        : "לא צוין";
-
-  const calories = Number(item?.calories ?? item?.kcal ?? 0);
-  const protein = Number(item?.protein ?? 0);
-  const carbs = Number(item?.carbs ?? item?.carbohydrates ?? 0);
-  const fat = Number(item?.fat ?? item?.fats ?? 0);
-
-  return {
-    name: String(item?.name || item?.foodName || item?.ingredientName || "רכיב"),
-    quantity,
-    calories: Number.isFinite(calories) ? calories : 0,
-    protein: Number.isFinite(protein) ? protein : 0,
-    carbs: Number.isFinite(carbs) ? carbs : 0,
-    fat: Number.isFinite(fat) ? fat : 0,
-  };
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
 }
 
-export async function analyzeMealImage(imagePath) {
-  const client = getClient();
+function buildAnalysisPrompt(userNote = "") {
+  return `
+Analyze the food image and return ONLY valid JSON.
 
+Schema:
+{
+  "mealName": "string in Hebrew",
+  "description": "short Hebrew description",
+  "totalEstimatedQuantityGrams": 0,
+  "totalCalories": 0,
+  "totalProteinGrams": 0,
+  "totalCarbohydratesGrams": 0,
+  "totalFatGrams": 0,
+  "confidence": 0.85,
+  "estimationNotes": ["short note"],
+  "needsClarification": false,
+  "clarificationQuestion": null,
+  "ingredients": [
+    {
+      "name": "string in Hebrew",
+      "estimatedQuantity": "human readable portion in Hebrew",
+      "estimatedQuantityGrams": 0,
+      "calories": 0,
+      "proteinGrams": 0,
+      "carbohydratesGrams": 0,
+      "fatGrams": 0,
+      "confidence": 0.8
+    }
+  ]
+}
+
+Rules:
+- Output JSON only.
+- Use approximate quantities when exact grams are uncertain.
+- Never use strings like "לא זמין" in numeric fields.
+- If you cannot know an exact quantity, still estimate a portion such as bowl, spoon, count, slice, roll, or unit.
+- If confidence is too low for a meaningful estimate, set needsClarification=true and add one short Hebrew clarificationQuestion.
+- estimationNotes should be short and factual.
+- Meal name and ingredient names must be Hebrew.
+
+User note: ${userNote || "אין הערת משתמש."}
+`.trim();
+}
+
+function buildRepairPrompt(analysis) {
+  return `
+Repair only missing or weak nutrition estimate fields for this already-identified meal.
+Return ONLY valid JSON using the same schema.
+
+Keep existing strong fields consistent.
+Focus on filling missing quantities, grams, calories, protein, carbohydrates, fat, and totals.
+Use approximate portions if needed.
+
+Existing analysis:
+${JSON.stringify(analysis, null, 2)}
+`.trim();
+}
+
+async function callStructuredMealAnalysis({ dataUrl, prompt }) {
+  const client = getClient();
   if (!client) {
     const err = new Error("AI analysis is not configured");
     err.code = "AI_NOT_CONFIGURED";
     throw err;
   }
 
-  const imageBuffer = fs.readFileSync(imagePath);
-  const ext = path.extname(imagePath).toLowerCase().replace(".", "") || "jpeg";
-  const mimeType =
-    ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
-  const dataUrl = `data:${mimeType};base64,${imageBuffer.toString("base64")}`;
-
-  const prompt = `Analyze the food in this uploaded image. Do not assume it is yogurt, blueberries, or honey unless they are clearly visible.
-
-Return ONLY a valid JSON object with this exact structure (no markdown, no extra text):
-{
-  "mealName": "name of the meal in Hebrew",
-  "ingredients": [
-    {
-      "name": "ingredient name in Hebrew",
-      "quantity": "estimated quantity e.g. 1 unit, 150g",
-      "calories": 0,
-      "protein": 0,
-      "carbs": 0,
-      "fat": 0
-    }
-  ],
-  "totalCalories": 0,
-  "protein": 0,
-  "carbs": 0,
-  "fat": 0,
-  "confidence": 0.9
-}
-
-Rules:
-- All numeric values must be numbers, not strings.
-- confidence is a number from 0 to 1.
-- If food is unclear, set confidence to a low value (e.g. 0.3).
-- mealName and ingredient names must be in Hebrew.
-- Estimate nutrition values based on standard portions visible in the image.
-- For every ingredient, quantity is required and should be in grams when possible (e.g. "100 גרם").
-- For every ingredient, include calories, protein, carbs, and fat as numeric estimates even if confidence is low.
-- Never omit ingredient nutrition fields.`;
-
   const resp = await client.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.1,
-    response_format: { type: "json_object" },
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "meal_analysis",
+        schema: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+    },
     messages: [
       {
         role: "user",
@@ -108,35 +127,133 @@ Rules:
     ],
   });
 
-  const raw = resp.choices?.[0]?.message?.content?.trim() || "";
-  if (DEBUG_MEAL_ANALYSIS) {
-    console.log("[meal-analysis] raw ai response", raw);
-  }
+  return String(resp.choices?.[0]?.message?.content || "").trim();
+}
 
-  const cleaned = stripJsonCodeBlock(raw);
-
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    const parseErr = new Error(`AI returned invalid JSON: ${raw.slice(0, 300)}`);
-    parseErr.code = "AI_PARSE_ERROR";
-    throw parseErr;
-  }
-
-  if (DEBUG_MEAL_ANALYSIS) {
-    console.log("[meal-analysis] parsed ai analysis", parsed);
-  }
-
+function withClarificationMetadata(analysis, raw = {}) {
   return {
-    mealName: String(parsed.mealName || "ארוחה לא מזוהה"),
-    ingredients: Array.isArray(parsed.ingredients)
-      ? parsed.ingredients.map(normalizeIngredient)
-      : [],
-    totalCalories: Number(parsed.totalCalories || 0),
-    protein: Number(parsed.protein || 0),
-    carbs: Number(parsed.carbs || 0),
-    fat: Number(parsed.fat || 0),
-    confidence: Number(parsed.confidence || 0),
+    ...analysis,
+    needsClarification: Boolean(raw?.needsClarification) || mealAnalysisNeedsClarification(analysis),
+    clarificationQuestion:
+      typeof raw?.clarificationQuestion === "string" && raw.clarificationQuestion.trim()
+        ? raw.clarificationQuestion.trim()
+        : null,
   };
+}
+
+export async function analyzeMealDataUrl(dataUrl, userNote = "") {
+  try {
+    console.log("MEAL ANALYSIS STARTED", {
+      ingredientCount: 0,
+    });
+
+    const raw = await callStructuredMealAnalysis({
+      dataUrl,
+      prompt: buildAnalysisPrompt(userNote),
+    });
+
+    const parsed = parseJsonResponse(raw);
+    if (!parsed) {
+      const parseErr = new Error(`AI returned invalid JSON: ${raw.slice(0, 300)}`);
+      parseErr.code = "AI_PARSE_ERROR";
+      throw parseErr;
+    }
+
+    let normalized = withClarificationMetadata(normalizeMealAnalysis(parsed), parsed);
+
+    console.log("MEAL ANALYSIS PARSED", {
+      ingredientCount: normalized.ingredients.length,
+      confidence: normalized.confidence,
+    });
+
+    if (mealAnalysisNeedsRepair(normalized)) {
+      console.log("MEAL ANALYSIS REPAIR STARTED", {
+        ingredientCount: normalized.ingredients.length,
+        confidence: normalized.confidence,
+      });
+
+      const repairRaw = await callStructuredMealAnalysis({
+        dataUrl,
+        prompt: buildRepairPrompt(normalized),
+      });
+      const repairParsed = parseJsonResponse(repairRaw);
+      if (repairParsed) {
+        normalized = withClarificationMetadata(
+          mergeMissingMealAnalysisFields(normalized, repairParsed),
+          repairParsed,
+        );
+        console.log("MEAL ANALYSIS REPAIR COMPLETED", {
+          ingredientCount: normalized.ingredients.length,
+          confidence: normalized.confidence,
+        });
+      }
+    }
+
+    const warnings = [];
+    if (!normalized.totalCalories && normalized.ingredients.length) {
+      warnings.push("missing_total_calories");
+    }
+    if (normalized.confidence < 0.45) {
+      warnings.push("low_confidence");
+    }
+    if (warnings.length) {
+      console.log("MEAL ANALYSIS VALIDATION WARNING", {
+        ingredientCount: normalized.ingredients.length,
+        confidence: normalized.confidence,
+        warnings,
+      });
+    }
+
+    return normalized;
+  } catch (error) {
+    console.log("MEAL ANALYSIS FAILED", {
+      error: error?.message || error,
+    });
+    throw error;
+  }
+}
+
+export async function repairMealAnalysisFromClarification(analysis, clarificationAnswer) {
+  const normalized = normalizeMealAnalysis(analysis);
+  const client = getClient();
+
+  if (!client) {
+    const err = new Error("AI analysis is not configured");
+    err.code = "AI_NOT_CONFIGURED";
+    throw err;
+  }
+
+  const prompt = `
+Refine this meal analysis using the user's clarification.
+Return ONLY valid JSON using the same schema as before.
+
+Existing analysis:
+${JSON.stringify(normalized, null, 2)}
+
+User clarification:
+${clarificationAnswer}
+`.trim();
+
+  const resp = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.1,
+    response_format: { type: "json_object" },
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const raw = String(resp.choices?.[0]?.message?.content || "").trim();
+  const parsed = parseJsonResponse(raw);
+  if (!parsed) return normalized;
+
+  return withClarificationMetadata(mergeMissingMealAnalysisFields(normalized, parsed), parsed);
+}
+
+export async function analyzeMealImage(imagePath) {
+  const imageBuffer = fs.readFileSync(imagePath);
+  const ext = path.extname(imagePath).toLowerCase().replace(".", "") || "jpeg";
+  const mimeType =
+    ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+  const dataUrl = `data:${mimeType};base64,${imageBuffer.toString("base64")}`;
+
+  return analyzeMealDataUrl(dataUrl);
 }
