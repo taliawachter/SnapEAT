@@ -316,6 +316,54 @@ export async function getUnsummarizedMessages(
   }
 }
 
+export async function getRecentEligibleMessages(
+  userId,
+  { limit = 8, afterTimestamp = null } = {}
+) {
+  assertRequiredString(userId, "userId");
+
+  const normalizedUserId = userId.trim();
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit)
+    ? Math.max(2, Math.min(20, Math.floor(parsedLimit)))
+    : 8;
+  const afterDate = toDateOrNull(afterTimestamp);
+
+  try {
+    let query = db
+      .collection(CHAT_MESSAGES_COLLECTION)
+      .where("userId", "==", normalizedUserId)
+      .where("isSummaryEligible", "==", true)
+      .where("role", "in", ["user", "assistant"])
+      .orderBy("createdAt", "desc");
+
+    if (afterDate) {
+      query = query.where("createdAt", ">", afterDate);
+    }
+
+    const snapshot = await query.limit(safeLimit).get();
+
+    return snapshot.docs
+      .map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }))
+      .filter((item) => {
+        const role = String(item?.role || "").trim();
+        const content = String(item?.content || "").trim();
+        return (role === "user" || role === "assistant") && Boolean(content);
+      })
+      .reverse();
+  } catch (error) {
+    console.error("Failed to fetch recent eligible messages", {
+      userId,
+      limit: safeLimit,
+      error: error.message,
+    });
+    throw error;
+  }
+}
+
 export async function saveConversationSummary(userId, summary) {
   assertRequiredString(userId, "userId");
 

@@ -33,6 +33,12 @@ const CONVERSATION_SUMMARY_THRESHOLD = Number.isFinite(parsedConversationSummary
   : DEFAULT_CONVERSATION_SUMMARY_THRESHOLD;
 const CONVERSATION_SUMMARY_MODEL = "gpt-4o-mini";
 
+const DEFAULT_MEMORY_RECENT_MESSAGES_LIMIT = 8;
+const parsedMemoryRecentMessagesLimit = Number(process.env.MEMORY_RECENT_MESSAGES_LIMIT);
+const MEMORY_RECENT_MESSAGES_LIMIT = Number.isFinite(parsedMemoryRecentMessagesLimit)
+  ? Math.max(2, Math.min(20, Math.floor(parsedMemoryRecentMessagesLimit)))
+  : DEFAULT_MEMORY_RECENT_MESSAGES_LIMIT;
+
 function normalizePhone(value = "") {
   let phone = String(value);
 
@@ -153,16 +159,253 @@ function sanitizeMemoryUpdate(memoryUpdate) {
   return Object.keys(filtered).length ? filtered : null;
 }
 
-function formatRecentMessagesForPrompt(messages = []) {
-  if (!Array.isArray(messages) || !messages.length) return "אין היסטוריית שיחה קודמת.";
+function normalizeContentForComparison(value = "") {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function toMillisOrNull(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value?.toDate === "function") {
+    const dt = value.toDate();
+    return dt instanceof Date ? dt.getTime() : null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+}
+
+function sanitizeLongTermMemoryForContext(userMemory) {
+  const profile = userMemory?.profile;
+  if (!profile || typeof profile !== "object") return null;
+
+  const fields = [
+    "goalWeight",
+    "weight",
+    "height",
+    "activityLevel",
+    "dietPreferences",
+    "allergies",
+    "likedFoods",
+    "dislikedFoods",
+    "notes",
+  ];
+
+  const cleaned = {};
+
+  for (const field of fields) {
+    const raw = profile[field];
+    if (raw === undefined || raw === null) continue;
+
+    if (Array.isArray(raw)) {
+      const values = Array.from(
+        new Set(raw.map((item) => String(item || "").trim()).filter(Boolean))
+      );
+      if (values.length) cleaned[field] = values;
+      continue;
+    }
+
+    if (typeof raw === "number") {
+      if (Number.isFinite(raw)) cleaned[field] = raw;
+      continue;
+    }
+
+    const asString = String(raw).trim();
+    if (asString) cleaned[field] = asString;
+  }
+
+  return Object.keys(cleaned).length ? cleaned : null;
+}
+
+function formatLongTermMemorySection(longTermMemory) {
+  if (!longTermMemory) return "אין זיכרון משתמש ארוך-טווח.";
+  try {
+    return JSON.stringify(longTermMemory, null, 2);
+  } catch {
+    return "אין זיכרון משתמש ארוך-טווח.";
+  }
+}
+
+function formatRecentConversationSection(messages = []) {
+  if (!Array.isArray(messages) || !messages.length) return "אין הודעות אחרונות זמינות.";
 
   return messages
-    .map((msg, index) => {
-      const role = String(msg?.role || "user");
-      const content = String(msg?.content || "");
-      return `${index + 1}. ${role}: ${content}`;
+    .map((msg) => {
+      const role = String(msg?.role || "user").toLowerCase() === "assistant" ? "Assistant" : "User";
+      const content = String(msg?.content || "").trim();
+      return `${role}: ${content}`;
     })
     .join("\n");
+}
+
+function dedupeRecentMessages(messages = []) {
+  const seen = new Set();
+  const deduped = [];
+
+  for (const msg of messages) {
+    const role = String(msg?.role || "").trim();
+    const content = String(msg?.content || "").trim();
+    if (!(role === "user" || role === "assistant") || !content) continue;
+
+    const key = [
+      role,
+      String(msg?.messageId || ""),
+      normalizeContentForComparison(content),
+      String(toMillisOrNull(msg?.createdAt) || ""),
+    ].join("|");
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push({
+      role,
+      content,
+      createdAt: msg?.createdAt,
+      messageId: msg?.messageId || null,
+    });
+  }
+
+  return deduped;
+}
+
+function dropCurrentUserMessageDuplicate(messages = [], { currentUserMessage, currentMessageId, currentMessageTimestampMs }) {
+  if (!Array.isArray(messages) || !messages.length) return [];
+
+  if (currentMessageId) {
+    return messages.filter(
+      (msg) => !(msg.role === "user" && String(msg?.messageId || "") === String(currentMessageId))
+    );
+  }
+
+  const normalizedCurrent = normalizeContentForComparison(currentUserMessage);
+  if (!normalizedCurrent) return messages;
+
+  let removed = false;
+
+  return messages.filter((msg) => {
+    if (removed || msg.role !== "user") return true;
+
+    const sameContent = normalizeContentForComparison(msg.content) === normalizedCurrent;
+    if (!sameContent) return true;
+
+    if (!currentMessageTimestampMs) {
+      removed = true;
+      return false;
+    }
+
+    const msgTs = toMillisOrNull(msg.createdAt);
+    const withinWindow = msgTs !== null && Math.abs(msgTs - currentMessageTimestampMs) <= 2 * 60 * 1000;
+    if (!withinWindow) return true;
+
+    removed = true;
+    return false;
+  });
+}
+
+async function buildMemoryContext(phone, { currentUserMessage = "", currentMessageId = "", currentMessageTimestampMs = null } = {}) {
+  const memoryService = await getMemoryService();
+  const context = {
+    latestSummary: null,
+    longTermMemory: null,
+    recentMessages: [],
+  };
+
+  if (!memoryService) {
+    console.log("MEMORY CONTEXT READY", {
+      phone,
+      recentMessageCount: 0,
+      source: "all",
+    });
+    return context;
+  }
+
+  console.log("MEMORY RETRIEVAL STARTED", {
+    phone,
+    source: "all",
+  });
+
+  const [summaryResult, longTermResult, recentResult] = await Promise.allSettled([
+    memoryService.getLatestSummary(phone),
+    memoryService.getUserMemory(phone),
+    memoryService.getRecentEligibleMessages(phone, { limit: MEMORY_RECENT_MESSAGES_LIMIT }),
+  ]);
+
+  let summaryDoc = null;
+
+  if (summaryResult.status === "fulfilled") {
+    summaryDoc = summaryResult.value;
+    context.latestSummary = summaryDoc?.summary ? String(summaryDoc.summary).trim() : null;
+    console.log("MEMORY SUMMARY LOADED", {
+      phone,
+      source: "summary",
+      loaded: Boolean(context.latestSummary),
+    });
+  } else {
+    console.log("MEMORY SOURCE FAILED", {
+      phone,
+      source: "summary",
+      error: summaryResult.reason?.message || summaryResult.reason,
+    });
+  }
+
+  if (longTermResult.status === "fulfilled") {
+    context.longTermMemory = sanitizeLongTermMemoryForContext(longTermResult.value);
+    console.log("MEMORY LONG-TERM LOADED", {
+      phone,
+      source: "long-term",
+      loaded: Boolean(context.longTermMemory),
+    });
+  } else {
+    console.log("MEMORY SOURCE FAILED", {
+      phone,
+      source: "long-term",
+      error: longTermResult.reason?.message || longTermResult.reason,
+    });
+  }
+
+  if (recentResult.status === "fulfilled") {
+    let recentMessages = Array.isArray(recentResult.value) ? recentResult.value : [];
+
+    if (summaryDoc?.summarizedUntil) {
+      const summaryCutoffMs = toMillisOrNull(summaryDoc.summarizedUntil);
+      if (summaryCutoffMs !== null) {
+        recentMessages = recentMessages.filter((msg) => {
+          const msgMs = toMillisOrNull(msg?.createdAt);
+          return msgMs !== null && msgMs > summaryCutoffMs;
+        });
+      }
+    }
+
+    recentMessages = dedupeRecentMessages(recentMessages);
+    recentMessages = dropCurrentUserMessageDuplicate(recentMessages, {
+      currentUserMessage,
+      currentMessageId,
+      currentMessageTimestampMs,
+    });
+
+    context.recentMessages = recentMessages.slice(-MEMORY_RECENT_MESSAGES_LIMIT);
+
+    console.log("MEMORY RECENT MESSAGES LOADED", {
+      phone,
+      source: "recentMessages",
+      count: context.recentMessages.length,
+    });
+  } else {
+    console.log("MEMORY SOURCE FAILED", {
+      phone,
+      source: "recentMessages",
+      error: recentResult.reason?.message || recentResult.reason,
+    });
+  }
+
+  console.log("MEMORY CONTEXT READY", {
+    phone,
+    source: "all",
+    recentMessageCount: context.recentMessages.length,
+  });
+
+  return context;
 }
 
 function formatUserMemoryForPrompt(userMemory) {
@@ -625,28 +868,6 @@ async function saveMealEntry({
   }
 }
 
-async function getUserMeals(phone, limit = 5) {
-  const user = await getUserByPhone(phone);
-
-  if (!user) {
-    console.log("❌ לא נמצא משתמש:", phone);
-    return [];
-  }
-
-  const snapshot = await db
-    .collection("users")
-    .doc(user.id)
-    .collection("meals")
-    .orderBy("createdAt", "desc")
-    .limit(limit)
-    .get();
-
-  return snapshot.docs.map((doc) => ({
-    id: doc.id,
-    ...doc.data(),
-  }));
-}
-
 // =====================
 // Express
 // =====================
@@ -1013,49 +1234,12 @@ function cleanAnalysisText(text = "") {
 // =====================
 // OpenAI helpers
 // =====================
-async function generateReply(chatId, userText) {
-  const recentMeals = await getUserMeals(chatId, 5);
-  const memoryService = await getMemoryService();
-
-  let recentMessages = [];
-  let userMemory = null;
-  let latestSummary = null;
-
-  if (memoryService) {
-    try {
-      recentMessages = await memoryService.getRecentMessages(chatId, 10);
-    } catch (error) {
-      console.log("⚠️ getRecentMessages failed:", error?.message || error);
-    }
-
-    try {
-      userMemory = await memoryService.getUserMemory(chatId);
-    } catch (error) {
-      console.log("⚠️ getUserMemory failed:", error?.message || error);
-    }
-
-    try {
-      latestSummary = await memoryService.getLatestSummary(chatId);
-    } catch (error) {
-      console.log("⚠️ getLatestSummary failed:", error?.message || error);
-    }
-  }
-
-  const mealsSummary = recentMeals.length
-    ? recentMeals
-        .map(
-          (meal, i) =>
-            `${i + 1}. תאריך: ${meal.createdAt}
-סוג ארוחה: ${meal.mealType || "לא ידוע"}
-הערת משתמש: ${meal.mealNote || "ללא הערה"}
-ניתוח: ${meal.analysisText}`
-        )
-        .join("\n\n")
-    : "אין היסטוריית ארוחות קודמת.";
-
-  const latestSummaryText = latestSummary?.summary
-    ? String(latestSummary.summary)
-    : "אין סיכום שיחה זמין.";
+async function generateReply(chatId, userText, { currentMessageId = "", currentMessageTimestampMs = null } = {}) {
+  const memoryContext = await buildMemoryContext(chatId, {
+    currentUserMessage: userText,
+    currentMessageId,
+    currentMessageTimestampMs,
+  });
 
   const messages = [
     {
@@ -1069,7 +1253,13 @@ async function generateReply(chatId, userText) {
 - אם זו הודעה כללית, עדיין תעני בטבעיות ובנעימות.
 - תני תשובות פרקטיות וקצרות יחסית.
 - אם חסר מידע, שאלי שאלה אחת קצרה.
-- השתמשי בהיסטוריית הארוחות והזיכרון אם זה עוזר לתת תשובה אישית יותר.
+- השתמשי בזיכרון רק כשהוא רלוונטי לבקשה הנוכחית.
+- אל תחזרי על עובדות ידועות ללא צורך.
+- אל תטעני שיש זיכרון אם הוא לא קיים במפורש.
+- אל תמציאי אלרגיות, מטרות, ארוחות או עובדות רפואיות.
+- אם ההקשר לא חד-משמעי, שאלי שאלת הבהרה קצרה.
+- שמרי על שפה טבעית ושיחתית בעברית.
+- לעולם אל תחשפי למשתמש את מבנה הזיכרון הפנימי.
 - אל תתני ייעוץ רפואי.
 
 החזירי תמיד ורק JSON תקין במבנה הבא:
@@ -1093,22 +1283,25 @@ async function generateReply(chatId, userText) {
 - shouldSaveMemory=true רק אם המשתמש/ת נתן/ה מידע יציב וארוך-טווח.
 - לשמור רק שדות מתוך: height, weight, goalWeight, activityLevel, dietPreferences, allergies, likedFoods, dislikedFoods, notes.
 - לא לשמור מידע זמני, חד-פעמי, רעב רגעי, ארוחה של היום, מצב רוח רגעי.
-- אם אין עדכון זיכרון: shouldSaveMemory=false ו-memoryUpdate={}. 
-
-היסטוריית שיחה אחרונה:
-${formatRecentMessagesForPrompt(recentMessages)}
-
-זיכרון משתמש ארוך-טווח:
-${formatUserMemoryForPrompt(userMemory)}
-
-סיכום שיחה אחרון:
-${latestSummaryText}
-
-היסטוריית ארוחות אחרונה:
-${mealsSummary}
+- אם אין עדכון זיכרון: shouldSaveMemory=false ו-memoryUpdate={}.
 `.trim(),
     },
-    { role: "user", content: userText },
+    {
+      role: "user",
+      content: `
+[LONG-TERM USER MEMORY]
+${formatLongTermMemorySection(memoryContext.longTermMemory)}
+
+[LATEST CONVERSATION SUMMARY]
+${memoryContext.latestSummary || "אין סיכום שיחה זמין."}
+
+[RECENT CONVERSATION]
+${formatRecentConversationSection(memoryContext.recentMessages)}
+
+[CURRENT USER MESSAGE]
+${String(userText || "").trim()}
+`.trim(),
+    },
   ];
 
   const resp = await client.chat.completions.create({
@@ -1355,7 +1548,7 @@ async function startBot() {
         console.log("✅ Successfully connected to WhatsApp!");
         consecutive440Errors = 0;  // Reset error counter on success
         isStarting = false;
-        
+
         // Clear reconnection timer
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
@@ -1367,7 +1560,7 @@ async function startBot() {
       if (connection === "close") {
         const reason = lastDisconnect?.error?.output?.statusCode;
         const errorMessage = lastDisconnect?.error?.message || "Unknown error";
-        
+
         console.log(`\n❌ Connection closed - Code: ${reason} - ${errorMessage}`);
 
         // 401 Unauthorized - session expired or logged out
@@ -1640,7 +1833,10 @@ ${clarificationQuestion}`,
             }
           }
 
-      const replyData = await generateReply(resolvedPhone, cleanText);   
+      const replyData = await generateReply(resolvedPhone, cleanText, {
+        currentMessageId: msg?.key?.id || "",
+        currentMessageTimestampMs: toTimestampMs(msg?.messageTimestamp),
+      });
        const reply = replyData?.reply || replyData;
 
           await sock.sendMessage(from, { text: reply });
@@ -1703,7 +1899,7 @@ ${clarificationQuestion}`,
     console.log("❌ ❌ Fatal error initializing bot:", err?.message || err);
     console.log("Stack trace:", err?.stack);
     isStarting = false;
-    
+
     // Retry after delay
     console.log("🔄 Retrying in 5 seconds...");
     if (!reconnectTimer) {
