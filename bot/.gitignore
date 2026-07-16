@@ -1,0 +1,19 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+firebase-service-account.json
+auth_info/
+
+# Dependencies
+node_modules/
+
+# Runtime and uploads
+uploads/
+public/uploads/
+
+# Build output
+dist/
+
+# Logs
+*.log

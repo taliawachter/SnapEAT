@@ -38,6 +38,32 @@ import {
   extractBearerToken,
   validateMealEditDraft,
 } from "../shared/meal-edit.js";
+import { isGeneralNutritionQuestion } from "./services/nutrition-routing.helper.js";
+import { getNutritionKnowledgeAnswer } from "./services/nutrition-knowledge.service.js";
+import {
+  getProductByBarcode,
+  calculateNutritionForWeight,
+  calculateNutritionForPackageFraction,
+  hasUsableCoreNutrition,
+  formatProductNutritionForUser,
+  formatProductConfirmationSummary,
+  formatPackageFractionLabel,
+  findBarcodeCandidate,
+  hasExplicitBarcodeIntent,
+  PRODUCT_NOT_FOUND_HEBREW,
+  PRODUCT_LOOKUP_UNAVAILABLE_HEBREW,
+  PRODUCT_INCOMPLETE_HEBREW,
+  INVALID_BARCODE_HEBREW,
+  PACKAGE_WEIGHT_IS_VOLUME_HEBREW,
+} from "./services/food-product.service.js";
+import { parseProductAmountInput } from "./services/product-amount.helper.js";
+import { decodeBarcodeFromImage } from "./services/barcode-image.service.js";
+import {
+  resolveImageBarcodeRouting,
+  isBarcodeModeActive,
+  IMAGE_BARCODE_ROUTES,
+} from "./services/barcode-image-routing.helper.js";
+import { classifyPackagedProductImage } from "./services/packaged-product-image.service.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1164,6 +1190,304 @@ async function saveMealEntry({
 }
 
 // =====================
+// Packaged Product Lookup (Open Food Facts)
+// =====================
+const PRODUCT_CANCELLATION_WORDS = ["לא", "ביטול", "בטל", "עזוב"];
+
+const BARCODE_READ_FAILED_HEBREW = `לא הצלחתי לקרוא את הברקוד.
+
+כדי שאוכל לזהות את המוצר בצורה מדויקת, צלמי את הברקוד מקרוב:
+
+• הברקוד צריך להיות ישר מול המצלמה.
+• כל הברקוד צריך להופיע בתמונה.
+• חשוב שהתמונה תהיה חדה ובתאורה טובה.
+• רצוי לצלם רק את הברקוד, בלי כל האריזה.
+
+לאחר מכן שלחי את התמונה שוב.`;
+
+const BARCODE_MODE_ACTIVATED_HEBREW = `שלחי עכשיו צילום ישר וברור של הברקוד בלבד.
+
+חשוב שכל הפסים והמספרים יופיעו בתמונה, בלי טשטוש ובתאורה טובה.`;
+
+const PACKAGED_PRODUCT_DETECTED_HEBREW = `נראה שזה מוצר ארוז 📦
+
+כדי לזהות את המוצר בצורה מדויקת ולקבל את הערכים התזונתיים הנכונים, שלחי צילום ברור וישר של הברקוד שעל האריזה.
+
+חשוב שכל הפסים והמספרים יופיעו בתמונה, בלי טשטוש ובתאורה טובה.`;
+
+function isCancellationMessage(text = "") {
+  const normalized = String(text || "").trim();
+  return PRODUCT_CANCELLATION_WORDS.some(
+    (word) => normalized === word || normalized.startsWith(`${word} `) || normalized.startsWith(`${word},`)
+  );
+}
+
+function isPositiveConfirmation(text = "") {
+  const normalized = String(text || "").trim();
+  return normalized === "כן" || normalized.startsWith("כן ") || normalized.startsWith("כן,") || normalized.startsWith("כן.");
+}
+
+function shouldStartProductLookup(text = "") {
+  return hasExplicitBarcodeIntent(text);
+}
+
+function buildProductAnalysisForStorage(product, calculation) {
+  const quantityText =
+    calculation.amountType === "package_fraction"
+      ? formatPackageFractionLabel(calculation.packageFraction)
+      : `${calculation.weightGrams} גרם`;
+
+  const ingredient = {
+    name: product.name,
+    estimatedQuantity: quantityText,
+    estimatedQuantityGrams: calculation.weightGrams,
+    calories: calculation.calories,
+    proteinGrams: calculation.proteinGrams,
+    carbohydratesGrams: calculation.carbohydratesGrams,
+    fatGrams: calculation.fatGrams,
+    confidence: 1,
+  };
+
+  return {
+    mealName: product.name,
+    description: product.brand ? `${product.name} - ${product.brand}` : product.name,
+    totalEstimatedQuantityGrams: calculation.weightGrams,
+    totalCalories: calculation.calories,
+    totalProteinGrams: calculation.proteinGrams,
+    totalCarbohydratesGrams: calculation.carbohydratesGrams,
+    totalFatGrams: calculation.fatGrams,
+    confidence: 1,
+    estimationNotes: ["מבוסס על נתוני מאגר Open Food Facts, לא הערכת תמונה."],
+    ingredients: [ingredient],
+  };
+}
+
+async function saveProductMealEntry({ phone, product, calculation, mealType }) {
+  const normalizedPhone = normalizePhone(phone);
+  const user = await getUserByPhone(normalizedPhone);
+
+  if (!user) {
+    console.log("❌ משתמש לא נמצא (מוצר ארוז):", normalizedPhone);
+    return false;
+  }
+
+  const validMealTypes = ["breakfast", "lunch", "dinner", "snack"];
+  if (!validMealTypes.includes(mealType)) {
+    console.log("❌ סוג ארוחה לא חוקי (מוצר ארוז):", mealType);
+    return false;
+  }
+
+  const userRef = db.collection("users").doc(user.id);
+
+  try {
+    const analysis = buildProductAnalysisForStorage(product, calculation);
+    const entry = buildStoredMealEntry({
+      mealType,
+      mealName: analysis.mealName,
+      imageUrl: product.imageUrl || "",
+      analysis,
+      source: "whatsapp",
+      phone,
+    });
+
+    entry.createdAt = FieldValue.serverTimestamp();
+    entry.sourceType = "OPEN_FOOD_FACTS";
+    entry.productBarcode = product.barcode;
+    entry.productName = product.name;
+    entry.productBrand = product.brand;
+    entry.consumedWeightGrams = calculation.weightGrams;
+    entry.packageFraction = calculation.packageFraction;
+    entry.nutritionPer100g = product.nutritionPer100g;
+    entry.calculatedNutrition = calculation;
+    entry.sourceLastModifiedAt = product.lastModifiedAt;
+    entry.sourceQualityTags = product.qualityTags || [];
+    entry.isEstimated = false;
+    entry.isDatabaseReported = true;
+
+    await userRef.collection("meals").add(entry);
+
+    console.log("✅ מוצר ארוז נשמר עבור user:", user.id, "סוג:", mealType);
+    return true;
+  } catch (error) {
+    console.log("❌ שגיאה בשמירת מוצר ארוז:", error?.message || error);
+    return false;
+  }
+}
+
+async function startProductLookupFlow({ sock, from, cleanText }) {
+  const candidate = findBarcodeCandidate(cleanText);
+
+  if (!candidate) {
+    pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
+    await sock.sendMessage(from, { text: BARCODE_MODE_ACTIVATED_HEBREW });
+    return;
+  }
+
+  await lookupAndRespondWithProduct({ sock, from, barcode: candidate });
+}
+
+async function lookupAndRespondWithProduct({ sock, from, barcode }) {
+  const result = await getProductByBarcode(barcode);
+
+  if (!result.found) {
+    if (result.errorCode === "PRODUCT_LOOKUP_FAILED") {
+      pending.delete(from);
+      await sock.sendMessage(from, { text: PRODUCT_LOOKUP_UNAVAILABLE_HEBREW });
+      return;
+    }
+
+    if (result.errorCode === "PRODUCT_NOT_FOUND") {
+      pending.delete(from);
+      await sock.sendMessage(from, { text: PRODUCT_NOT_FOUND_HEBREW });
+      return;
+    }
+
+    // Invalid barcode format/length — let the user retry rather than failing hard.
+    pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
+    await sock.sendMessage(from, { text: INVALID_BARCODE_HEBREW });
+    return;
+  }
+
+  const product = result.product;
+
+  if (!hasUsableCoreNutrition(product)) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: PRODUCT_INCOMPLETE_HEBREW });
+    return;
+  }
+
+  pending.set(from, { step: "awaiting_product_amount", product, createdAt: Date.now() });
+  await sock.sendMessage(from, { text: formatProductNutritionForUser(product) });
+}
+
+async function handleProductBarcodeInput({ sock, from, cleanText }) {
+  if (isCancellationMessage(cleanText)) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: "בסדר, ביטלתי את חיפוש המוצר." });
+    return;
+  }
+
+  const candidate = findBarcodeCandidate(cleanText) || cleanText;
+  await lookupAndRespondWithProduct({ sock, from, barcode: candidate });
+}
+
+async function handleProductAmountInput({ sock, from, cleanText, pendingEntry }) {
+  if (isCancellationMessage(cleanText)) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: "בסדר, לא הוספתי את המוצר." });
+    return;
+  }
+
+  const parsed = parseProductAmountInput(cleanText);
+
+  if (parsed.type === "unsupported_unit") {
+    await sock.sendMessage(from, {
+      text: "כדי לחשב בצורה אמינה אני צריכה משקל בגרמים, או חלק מהאריזה אם משקל האריזה ידוע.",
+    });
+    return;
+  }
+
+  if (parsed.type === "ambiguous") {
+    await sock.sendMessage(from, {
+      text: "לא הבנתי כמה נאכל. אפשר לכתוב, למשל: 125 גרם, חצי אריזה, או אריזה שלמה.",
+    });
+    return;
+  }
+
+  const product = pendingEntry.product;
+  const calcResult =
+    parsed.type === "grams"
+      ? calculateNutritionForWeight(product.nutritionPer100g, parsed.grams)
+      : calculateNutritionForPackageFraction(product, parsed.fraction);
+
+  if (!calcResult.ok) {
+    if (calcResult.errorCode === "PACKAGE_WEIGHT_IS_VOLUME") {
+      await sock.sendMessage(from, { text: PACKAGE_WEIGHT_IS_VOLUME_HEBREW });
+      return;
+    }
+
+    if (calcResult.errorCode === "UNKNOWN_PACKAGE_WEIGHT") {
+      await sock.sendMessage(from, {
+        text: "לא ידוע לי משקל האריזה של המוצר הזה, ולכן אי אפשר לחשב לפי חלק מהאריזה. אפשר לכתוב כמות בגרמים?",
+      });
+      return;
+    }
+
+    await sock.sendMessage(from, {
+      text: "הכמות שכתבת לא תקינה. אפשר לכתוב מספר גרמים סביר, או חלק מהאריזה?",
+    });
+    return;
+  }
+
+  pending.set(from, {
+    step: "awaiting_product_confirmation",
+    product,
+    calculation: calcResult.result,
+    createdAt: Date.now(),
+  });
+
+  await sock.sendMessage(from, {
+    text: formatProductConfirmationSummary(product, calcResult.result),
+  });
+}
+
+async function handleProductConfirmationInput({ sock, from, cleanText, pendingEntry }) {
+  if (isCancellationMessage(cleanText)) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: "בסדר, לא הוספתי את המוצר." });
+    return;
+  }
+
+  if (!isPositiveConfirmation(cleanText)) {
+    await sock.sendMessage(from, { text: "אפשר לענות כן או לא?" });
+    return;
+  }
+
+  pending.set(from, {
+    step: "awaiting_product_meal_type",
+    product: pendingEntry.product,
+    calculation: pendingEntry.calculation,
+    createdAt: Date.now(),
+  });
+
+  await sock.sendMessage(from, {
+    text: "איזו ארוחה זו הייתה?\nכתבי רק אחת מהאפשרויות:\nבוקר\nצהריים\nערב\nביניים",
+  });
+}
+
+async function handleProductMealTypeInput({ sock, from, resolvedPhone, cleanText, pendingEntry }) {
+  if (isCancellationMessage(cleanText)) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: "בסדר, לא הוספתי את המוצר." });
+    return;
+  }
+
+  const mealType = normalizeMealType(cleanText);
+
+  if (!mealType) {
+    await sock.sendMessage(from, {
+      text: "לא הבנתי את סוג הארוחה.\nכתבי רק:\nבוקר\nצהריים\nערב\nביניים",
+    });
+    return;
+  }
+
+  const saved = await saveProductMealEntry({
+    phone: resolvedPhone,
+    product: pendingEntry.product,
+    calculation: pendingEntry.calculation,
+    mealType,
+  });
+
+  pending.delete(from);
+
+  await sock.sendMessage(from, {
+    text: saved
+      ? "✅ המוצר נוסף לארוחה ונשמר ביומן"
+      : "לא מצאתי משתמש באתר עם מספר הטלפון הזה. תוודאי שבאתר נשמר אותו מספר טלפון בדיוק.",
+  });
+}
+
+// =====================
 // Express
 // =====================
 app.use(express.static(path.join(__dirname, "public")));
@@ -1570,8 +1894,12 @@ function formatMealAnalysisForUser(analysis) {
 // =====================
 // OpenAI helpers
 // =====================
-async function generateReply(chatId, userText, { currentMessageId = "", currentMessageTimestampMs = null } = {}) {
-  const memoryContext = await buildMemoryContext(chatId, {
+async function generateReply(
+  chatId,
+  userText,
+  { currentMessageId = "", currentMessageTimestampMs = null, memoryContextOverride = null } = {}
+) {
+  const memoryContext = memoryContextOverride || await buildMemoryContext(chatId, {
     currentUserMessage: userText,
     currentMessageId,
     currentMessageTimestampMs,
@@ -1668,6 +1996,44 @@ ${String(userText || "").trim()}
     shouldSaveMemory,
     memoryUpdate,
   };
+}
+
+async function generateReplyWithNutritionKnowledge(
+  chatId,
+  userText,
+  { currentMessageId = "", currentMessageTimestampMs = null } = {}
+) {
+  const memoryContext = await buildMemoryContext(chatId, {
+    currentUserMessage: userText,
+    currentMessageId,
+    currentMessageTimestampMs,
+  });
+
+  if (isGeneralNutritionQuestion(userText)) {
+    const nutritionResult = await getNutritionKnowledgeAnswer({
+      question: userText,
+      userProfileSummary: formatLongTermMemorySection(memoryContext.longTermMemory),
+      memorySummary: memoryContext.latestSummary || "",
+      mealInfoSummary: "Use any meal totals provided by the app as authoritative.",
+      openaiClient: client,
+      env: process.env,
+      model: process.env.OPENAI_MODEL,
+    });
+
+    if (!nutritionResult.shouldUseDefaultFlow && nutritionResult.answer) {
+      return {
+        reply: nutritionResult.answer,
+        shouldSaveMemory: false,
+        memoryUpdate: null,
+      };
+    }
+  }
+
+  return generateReply(chatId, userText, {
+    currentMessageId,
+    currentMessageTimestampMs,
+    memoryContextOverride: memoryContext,
+  });
 }
 
 // =====================
@@ -1932,6 +2298,66 @@ async function startBot() {
       try {
 
         if (imageMessage) {
+          const buffer = await downloadMediaMessage(
+            msg,
+            "buffer",
+            {},
+            { reuploadRequest: sock.updateMediaMessage }
+          );
+
+          let barcodeDecodeResult = { found: false, barcode: null, format: null, errorCode: null };
+          try {
+            barcodeDecodeResult = await decodeBarcodeFromImage(buffer);
+          } catch (decodeError) {
+            console.log("BARCODE IMAGE DECODE FAILED", {
+              error: decodeError?.code || "decode_error",
+            });
+          }
+
+          const pendingStepBeforeImage = pending.get(from)?.step || null;
+
+          let packagedProductClassification = null;
+          if (
+            !barcodeDecodeResult.found &&
+            !isBarcodeModeActive({ pendingStep: pendingStepBeforeImage, captionText: text })
+          ) {
+            try {
+              const classifyResult = await classifyPackagedProductImage(buffer);
+              packagedProductClassification = classifyResult.classification;
+            } catch (classifyError) {
+              console.log("PACKAGED PRODUCT CLASSIFICATION FAILED", {
+                error: classifyError?.code || "classification_error",
+              });
+            }
+          }
+
+          const imageBarcodeRoute = resolveImageBarcodeRouting({
+            barcodeFound: barcodeDecodeResult.found,
+            pendingStep: pendingStepBeforeImage,
+            captionText: text,
+            packagedProductClassification,
+          });
+
+          if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.PRODUCT_FLOW) {
+            addToHistory(resolvedPhone, "user", text ? `[תמונה עם ברקוד] ${text}` : "[תמונה עם ברקוד]");
+            await lookupAndRespondWithProduct({ sock, from, barcode: barcodeDecodeResult.barcode });
+            return;
+          }
+
+          if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.BARCODE_GUIDANCE) {
+            pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
+            addToHistory(resolvedPhone, "user", text ? `[תמונת ברקוד] ${text}` : "[תמונת ברקוד]");
+            await sock.sendMessage(from, { text: BARCODE_READ_FAILED_HEBREW });
+            return;
+          }
+
+          if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.REQUEST_BARCODE) {
+            pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
+            addToHistory(resolvedPhone, "user", text ? `[תמונת מוצר ארוז] ${text}` : "[תמונת מוצר ארוז]");
+            await sock.sendMessage(from, { text: PACKAGED_PRODUCT_DETECTED_HEBREW });
+            return;
+          }
+
           console.log("MEAL ANALYSIS STARTED", {
             ingredientCount: 0,
             confidence: null,
@@ -1940,13 +2366,6 @@ async function startBot() {
           await sock.sendMessage(from, {
             text: "מנתחת את התמונה עכשיו, רגע 🙏",
           });
-
-          const buffer = await downloadMediaMessage(
-            msg,
-            "buffer",
-            {},
-            { reuploadRequest: sock.updateMediaMessage }
-          );
 
           const mime = imageMessage.mimetype || "image/jpeg";
           const base64 = buffer.toString("base64");
@@ -2009,6 +2428,31 @@ ${clarificationQuestion}`,
         if (text.trim()) {
           const cleanText = text.trim();
           const p = pending.get(from);
+
+          if (p?.step === "awaiting_product_barcode") {
+            await handleProductBarcodeInput({ sock, from, cleanText });
+            return;
+          }
+
+          if (p?.step === "awaiting_product_amount") {
+            await handleProductAmountInput({ sock, from, cleanText, pendingEntry: p });
+            return;
+          }
+
+          if (p?.step === "awaiting_product_confirmation") {
+            await handleProductConfirmationInput({ sock, from, cleanText, pendingEntry: p });
+            return;
+          }
+
+          if (p?.step === "awaiting_product_meal_type") {
+            await handleProductMealTypeInput({ sock, from, resolvedPhone, cleanText, pendingEntry: p });
+            return;
+          }
+
+          if (!p && shouldStartProductLookup(cleanText)) {
+            await startProductLookupFlow({ sock, from, cleanText });
+            return;
+          }
 
           if (p?.step === "awaiting_clarification") {
             const refinedAnalysis = await repairMealAnalysisFromClarification(
@@ -2090,11 +2534,11 @@ ${clarificationQuestion}`,
             }
           }
 
-      const replyData = await generateReply(resolvedPhone, cleanText, {
-        currentMessageId: msg?.key?.id || "",
-        currentMessageTimestampMs: toTimestampMs(msg?.messageTimestamp),
-      });
-       const reply = replyData?.reply || replyData;
+          const replyData = await generateReplyWithNutritionKnowledge(resolvedPhone, cleanText, {
+            currentMessageId: msg?.key?.id || "",
+            currentMessageTimestampMs: toTimestampMs(msg?.messageTimestamp),
+          });
+          const reply = replyData?.reply || replyData;
 
           await sock.sendMessage(from, { text: reply });
 

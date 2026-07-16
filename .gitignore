@@ -43,3 +43,6 @@ bot/data/
 *.njsproj
 *.sln
 *.sw?
+
+
+printf "\n# Secrets and local authentication\n.env\nfirebase-service-account.json\nauth_info/\nuploads/\n" >> .gitignore
