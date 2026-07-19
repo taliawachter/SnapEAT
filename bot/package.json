@@ -6,7 +6,12 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node --experimental-test-module-mocks --test tests/*.test.js",
+    "test:unit": "node --experimental-test-module-mocks --test tests/*.test.js",
+    "test:integration": "node --experimental-test-module-mocks --test integration/*.test.js",
+    "coverage:unit": "mkdir -p coverage/unit && node --experimental-test-module-mocks --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/unit/lcov.info --test tests/*.test.js",
+    "coverage:integration": "mkdir -p coverage/integration && node --experimental-test-module-mocks --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/integration/lcov.info --test integration/*.test.js",
+    "coverage": "mkdir -p coverage && node --experimental-test-module-mocks --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info --test tests/*.test.js integration/*.test.js && lcov-viewer lcov coverage/lcov.info -o coverage/html",
     "knowledge:create": "node scripts/create-nutrition-knowledge-base.js"
   },
   "keywords": [],
@@ -21,5 +26,8 @@
     "openai": "^6.47.0",
     "qrcode-terminal": "^0.12.0",
     "zxing-wasm": "^3.1.1"
+  },
+  "devDependencies": {
+    "@lcov-viewer/cli": "^1.3.0"
   }
 }
