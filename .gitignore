@@ -44,5 +44,14 @@ bot/data/
 *.sln
 *.sw?
 
+# Coverage reports
+coverage/
+bot/coverage/
+
+# Generated evaluation reports
+evaluation/reports/
+
+
+
 
 printf "\n# Secrets and local authentication\n.env\nfirebase-service-account.json\nauth_info/\nuploads/\n" >> .gitignore
