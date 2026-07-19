@@ -33,6 +33,13 @@ uploads/
 bot/uploads/
 bot/data/
 
+# Generated evaluation reports (regenerate with `npm run evaluation`)
+evaluation/reports/*.json
+
+# Generated test coverage reports (regenerate with `npm run coverage`)
+coverage/
+bot/coverage/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
