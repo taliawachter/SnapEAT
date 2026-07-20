@@ -40,6 +40,25 @@ import {
 } from "../shared/meal-edit.js";
 import { isGeneralNutritionQuestion } from "./services/nutrition-routing.helper.js";
 import { getNutritionKnowledgeAnswer } from "./services/nutrition-knowledge.service.js";
+import { detectNutritionTargetRequest } from "./services/nutrition-targets-routing.helper.js";
+import {
+  getNutritionTarget,
+  getMissingFields as getMissingNutritionTargetFields,
+  buildMissingFieldsQuestion,
+  parseNutritionProfileFields,
+  parseSingleFieldAnswerResult,
+  getInvalidFieldMessage,
+  formatNutritionTargetReplyHebrew,
+  detectUnsafeConditions,
+  getUnsafeConditionMessage,
+  normalizeSex,
+  normalizeActivityLevel,
+  normalizeGoal,
+  mergeNutritionProfile,
+  ACTIVITY_LEVEL_SHORT_LABEL_HEBREW,
+  REQUIRED_CALORIE_FIELDS,
+  REQUIRED_PROTEIN_FIELDS,
+} from "./services/nutrition-targets.service.js";
 import {
   getProductByBarcode,
   calculateNutritionForWeight,
@@ -63,10 +82,26 @@ import {
   isBarcodeModeActive,
   IMAGE_BARCODE_ROUTES,
 } from "./services/barcode-image-routing.helper.js";
-import { classifyPackagedProductImage } from "./services/packaged-product-image.service.js";
+import {
+  classifyPackagedProductImage,
+  classifyFoodImage,
+  FOOD_IMAGE_MIN_CONFIDENCE,
+} from "./services/packaged-product-image.service.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// True only when this file is executed directly (`node index.js` / `npm
+// start`), not when it's imported by another module (e.g. a test process).
+// Gates the two real side-effecting startup calls below — app.listen()
+// (binds a real TCP port) and startBot() (an infinite WhatsApp
+// connect/retry loop) — so the orchestration functions in this file
+// (startNutritionTargetFlow, handleNutritionTargetInfoInput,
+// handleStandaloneProfileUpdate, etc.) can be imported and exercised
+// directly by integration tests with a mocked `sock`/Firestore, instead of
+// only through the hand-maintained Express-only mirror in
+// integration/app.harness.js.
+const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename);
 
 // =====================
 // Config
@@ -174,52 +209,6 @@ function parseAssistantJson(rawContent = "") {
       return null;
     }
   }
-}
-
-const LONG_TERM_MEMORY_FIELDS = [
-  "height",
-  "weight",
-  "goalWeight",
-  "activityLevel",
-  "dietPreferences",
-  "allergies",
-  "likedFoods",
-  "dislikedFoods",
-  "notes",
-];
-
-function sanitizeMemoryUpdate(memoryUpdate) {
-  if (!memoryUpdate || typeof memoryUpdate !== "object" || Array.isArray(memoryUpdate)) {
-    return null;
-  }
-
-  const filtered = {};
-
-  for (const field of LONG_TERM_MEMORY_FIELDS) {
-    const value = memoryUpdate[field];
-    if (value === undefined) continue;
-
-    if (field === "dietPreferences" || field === "allergies" || field === "likedFoods" || field === "dislikedFoods") {
-      if (Array.isArray(value)) {
-        filtered[field] = value
-          .map((item) => String(item || "").trim())
-          .filter(Boolean)
-          .slice(0, 50);
-      }
-      continue;
-    }
-
-    if (field === "height" || field === "weight" || field === "goalWeight") {
-      const num = Number(value);
-      if (Number.isFinite(num)) filtered[field] = num;
-      continue;
-    }
-
-    const asString = String(value || "").trim();
-    if (asString) filtered[field] = asString;
-  }
-
-  return Object.keys(filtered).length ? filtered : null;
 }
 
 function normalizeContentForComparison(value = "") {
@@ -1215,6 +1204,12 @@ const PACKAGED_PRODUCT_DETECTED_HEBREW = `נראה שזה מוצר ארוז 📦
 
 חשוב שכל הפסים והמספרים יופיעו בתמונה, בלי טשטוש ובתאורה טובה.`;
 
+const NON_FOOD_IMAGE_HEBREW =
+  "נראה שזו אינה תמונה של מזון. אפשר לשלוח תמונה של ארוחה, מוצר מזון או ברקוד.";
+
+const LOW_CONFIDENCE_FOOD_IMAGE_HEBREW =
+  "לא הצלחתי לזהות בוודאות שמדובר במזון. אפשר לצלם שוב כשהארוחה או המוצר מופיעים בבירור.";
+
 function isCancellationMessage(text = "") {
   const normalized = String(text || "").trim();
   return PRODUCT_CANCELLATION_WORDS.some(
@@ -1488,6 +1483,607 @@ async function handleProductMealTypeInput({ sock, from, resolvedPhone, cleanText
 }
 
 // =====================
+// Nutrition Targets (deterministic calorie/protein calculator)
+// =====================
+//
+// User asks a personal "how much should I eat" question
+//   -> detectNutritionTargetRequest() classifies it (deterministic, no LLM)
+//   -> getStoredNutritionProfileLayers() reads the two STORED layers: the
+//      web app's onboarding data (users/{uid}: gender/birthDate/height/
+//      weight, via the existing getUserByPhone()) and anything already
+//      collected for this purpose over WhatsApp (userMemories/{phone}
+//      .profile.targetProfile — a new, additive sub-object; it does not
+//      touch MEMORY_CATEGORIES or merge.helper.js at all)
+//   -> mergeNutritionProfile() (nutrition-targets.service.js) combines that
+//      with the in-session pending layer and whatever was just parsed from
+//      the CURRENT message, with strict last-write-wins priority: web <
+//      stored (WhatsApp) < pending (this session, prior turns) < current
+//      message. A value the user just stated can therefore never be
+//      shadowed by an older stored value — see mergeNutritionProfile's
+//      docstring for the full rationale.
+//   -> only the still-missing fields are asked for, via `pending`
+//   -> every turn's newly-parsed fields are persisted to Firestore
+//      immediately (not only once the flow completes), so a corrected
+//      value is never lost even if the user abandons the flow.
+//   -> once complete, nutrition-targets.service.js (pure, deterministic,
+//      no LLM) computes the result, which is relayed to the user.
+//
+// A message containing a correction OUTSIDE any active flow (e.g. "אני
+// שוקלת 65" sent on its own) is caught separately by
+// handleStandaloneProfileUpdate() below, so it is saved immediately
+// instead of falling through to the unconstrained generic chat function —
+// this was the root cause of a real stale-data bug: such a message used to
+// reach generateReply(), which could claim ("saved!") without ever writing
+// to targetProfile.
+
+function computeAgeFromBirthDate(birthDateStr) {
+  if (!birthDateStr) return null;
+  const parsed = new Date(birthDateStr);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  const now = new Date();
+  let age = now.getFullYear() - parsed.getFullYear();
+  const monthDiff = now.getMonth() - parsed.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < parsed.getDate())) {
+    age -= 1;
+  }
+
+  // A computed age below 5 is never a real user's age for this app — it's
+  // a malformed/placeholder birthDate value. Treating it as "unknown"
+  // (null) here means the caller correctly falls back to
+  // DEFAULT_CALCULATION_AGE instead of feeding an implausible age into the
+  // formula. This is a data-plausibility check, not an eligibility gate.
+  return age >= 5 && age <= 130 ? age : null;
+}
+
+async function getWebOnboardingProfileFields(resolvedPhone) {
+  try {
+    const user = await getUserByPhone(resolvedPhone);
+    if (!user) return {};
+
+    const fields = {};
+
+    const sex = normalizeSex(user.gender);
+    if (sex) fields.sex = sex;
+
+    if (Number.isFinite(Number(user.height))) fields.heightCm = Number(user.height);
+    if (Number.isFinite(Number(user.weight))) fields.weightKg = Number(user.weight);
+
+    const age = computeAgeFromBirthDate(user.birthDate);
+    if (age !== null) fields.age = age;
+
+    return fields;
+  } catch (error) {
+    console.log("NUTRITION TARGET WEB PROFILE LOOKUP FAILED", { error: error?.message || error });
+    return {};
+  }
+}
+
+function buildSafetyContextTextFromMemory(userMemory) {
+  const profile = userMemory?.profile;
+  if (!profile || typeof profile !== "object") return "";
+
+  const parts = [];
+  for (const field of ["importantNotes", "dietaryRestrictions", "allergies", "sensitivities", "goals"]) {
+    const value = profile[field];
+    if (Array.isArray(value) && value.length) parts.push(value.join(", "));
+  }
+
+  return parts.join(" | ");
+}
+
+// Reads the two STORED profile layers fresh from Firestore every time it is
+// called (never cached across turns) — see the module comment above for why
+// that matters: a mid-session correction saved by
+// handleStandaloneProfileUpdate() or a prior turn of this same flow must be
+// visible to the very next merge, not shadowed by a snapshot taken earlier.
+async function getStoredNutritionProfileLayers(resolvedPhone) {
+  const memoryService = await getMemoryService();
+  const userMemory = memoryService
+    ? await memoryService.getUserMemory(resolvedPhone).catch(() => null)
+    : null;
+
+  // Stored targetProfile values are re-normalized through the same
+  // canonical normalizers used for fresh input, not trusted as-is. This
+  // matters for data written before a prior activity-tier rename (e.g. the
+  // now-removed "active" tier) — without this, a legacy non-canonical
+  // value would pass through unchanged and crash the calculator with
+  // INVALID_ACTIVITY_LEVEL instead of being treated as simply unknown.
+  const rawStoredTargetProfile =
+    userMemory?.profile?.targetProfile && typeof userMemory.profile.targetProfile === "object"
+      ? userMemory.profile.targetProfile
+      : {};
+  const storedTargetProfile = { ...rawStoredTargetProfile };
+  if ("activityLevel" in storedTargetProfile) {
+    const normalized = normalizeActivityLevel(storedTargetProfile.activityLevel);
+    if (normalized) storedTargetProfile.activityLevel = normalized;
+    else delete storedTargetProfile.activityLevel;
+  }
+  if ("sex" in storedTargetProfile) {
+    const normalized = normalizeSex(storedTargetProfile.sex);
+    if (normalized) storedTargetProfile.sex = normalized;
+    else delete storedTargetProfile.sex;
+  }
+  if ("goal" in storedTargetProfile) {
+    const normalized = normalizeGoal(storedTargetProfile.goal);
+    if (normalized) storedTargetProfile.goal = normalized;
+    else delete storedTargetProfile.goal;
+  }
+
+  const webProfile = await getWebOnboardingProfileFields(resolvedPhone);
+  const safetyContext = buildSafetyContextTextFromMemory(userMemory);
+
+  return { webProfile, storedTargetProfile, safetyContext };
+}
+
+// Persists newly-known fields to userMemories/{phone}.profile.targetProfile
+// immediately (called on every turn that yields new info, not only once a
+// flow completes) so a corrected value can never be lost or superseded by
+// an older stored value on a later, separate turn.
+//
+// `age` is deliberately never persisted here, even when volunteered — see
+// bot/knowledge/00-scope-and-safety.md: age is never saved to the profile,
+// only ever used as transient in-memory input to a single calculation.
+// Returns { ok, savedFields } — savedFields contains ONLY fields that were
+// re-read back from Firestore after the write and verified to match what
+// was intended (never just "what we attempted to write"). Callers that
+// confirm a save to the user (handleStandaloneProfileUpdate) MUST build
+// their confirmation text from `savedFields`, never from the raw input —
+// a field must never be claimed as saved unless it was parsed, normalized,
+// validated, persisted, AND verified.
+async function saveTargetProfileFields(resolvedPhone, newFields, { messageId = "" } = {}) {
+  const { safetyContext, age, ...fieldsToSave } = newFields || {};
+  if (!Object.keys(fieldsToSave).length) return { ok: true, savedFields: {} };
+
+  try {
+    const memoryService = await getMemoryService();
+    if (!memoryService) return { ok: false, savedFields: {} };
+
+    const userMemory = await memoryService.getUserMemory(resolvedPhone);
+    const currentProfile =
+      userMemory?.profile && typeof userMemory.profile === "object" ? userMemory.profile : {};
+    const currentTargetProfile =
+      currentProfile.targetProfile && typeof currentProfile.targetProfile === "object"
+        ? currentProfile.targetProfile
+        : {};
+
+    const nextProfile = {
+      ...currentProfile,
+      targetProfile: {
+        ...currentTargetProfile,
+        ...fieldsToSave,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    await memoryService.applyIntelligentMemoryUpdate(resolvedPhone, {
+      updatedProfile: nextProfile,
+      messageId,
+      lastUpdatedCategories: ["targetProfile"],
+      lastUpdateSource: "nutrition_target_flow",
+      memoryVersion: 2,
+    });
+
+    // Re-read after writing — never assume a write applied just because it
+    // didn't throw. Only fields that verifiably round-trip through
+    // Firestore are ever reported back as saved.
+    const verifiedUserMemory = await memoryService.getUserMemory(resolvedPhone);
+    const verifiedTargetProfile =
+      verifiedUserMemory?.profile?.targetProfile && typeof verifiedUserMemory.profile.targetProfile === "object"
+        ? verifiedUserMemory.profile.targetProfile
+        : {};
+
+    const savedFields = {};
+    for (const [field, value] of Object.entries(fieldsToSave)) {
+      if (verifiedTargetProfile[field] === value) savedFields[field] = value;
+    }
+    const allVerified = Object.keys(fieldsToSave).every((field) => field in savedFields);
+
+    if (DEBUG_NUTRITION_TARGET) {
+      console.log("NUTRITION TARGET PROFILE SAVE (dev only)", {
+        phone: resolvedPhone,
+        fieldsSaved: Object.keys(fieldsToSave),
+        normalizedValues: fieldsToSave,
+        verifiedStoredProfile: verifiedTargetProfile,
+      });
+    }
+    if (!allVerified) {
+      console.log("NUTRITION TARGET PROFILE SAVE NOT FULLY VERIFIED", {
+        attempted: fieldsToSave,
+        verified: savedFields,
+      });
+    }
+
+    return { ok: allVerified, savedFields };
+  } catch (error) {
+    console.log("NUTRITION TARGET PROFILE SAVE FAILED", { error: error?.message || error });
+    return { ok: false, savedFields: {} };
+  }
+}
+
+function requiredNutritionFieldsForRequestType(requestType) {
+  if (requestType === "protein") return REQUIRED_PROTEIN_FIELDS;
+  if (requestType === "both") {
+    return Array.from(new Set([...REQUIRED_CALORIE_FIELDS, ...REQUIRED_PROTEIN_FIELDS]));
+  }
+  return REQUIRED_CALORIE_FIELDS;
+}
+
+// Dev-only visibility into exactly which values were used for a calculation
+// and where each one came from — never sent to the WhatsApp user. Enabled
+// via DEBUG_NUTRITION_TARGET=true, mirroring the existing
+// DEBUG_MEAL_ANALYSIS pattern in services/meal-analysis.js.
+const DEBUG_NUTRITION_TARGET = process.env.DEBUG_NUTRITION_TARGET === "true";
+
+// Logged exactly once per calculation, right before/around the actual
+// compute call, with the precise shape requested: the effective profile
+// (canonical field names only), where each field came from, and the
+// resulting bmr/maintenanceCalories/targetCalories. Never sent to the
+// WhatsApp user — console-only, gated by DEBUG_NUTRITION_TARGET.
+function logNutritionTargetCalculation({ requestType, profile, fieldSources, missingFields, result }) {
+  if (!DEBUG_NUTRITION_TARGET) return;
+
+  const calorieResult = requestType === "both" ? result.calories : result;
+  const calorieOk = calorieResult?.ok && calorieResult.requestType === "calories";
+
+  console.log("NUTRITION TARGET CALCULATION (dev only, never shown to the user)", {
+    requestType,
+    profile: {
+      weightKg: profile.weightKg,
+      heightCm: profile.heightCm,
+      sex: profile.sex,
+      activityLevel: profile.activityLevel,
+      goal: profile.goal,
+    },
+    fieldSources,
+    missingFields: missingFields || [],
+    bmr: calorieOk ? calorieResult.bmr : undefined,
+    maintenanceCalories: calorieOk ? calorieResult.maintenanceCalories : undefined,
+    targetCalories: calorieOk ? calorieResult.targetCalories : undefined,
+  });
+}
+
+async function respondWithNutritionTargetResult({
+  sock,
+  from,
+  resolvedPhone,
+  requestType,
+  profile,
+  fieldSources,
+  messageId,
+}) {
+  const result = getNutritionTarget({ requestType, profile });
+
+  // For requestType "both" the outer envelope is always {ok:true} (it
+  // wraps two independent sub-results) — the calorie sub-result is the
+  // stricter one (protein alone can't reveal an unsafe condition or an
+  // invalid sex/activity value), so it's checked as the primary signal.
+  // Without this, an unsafe-condition block on a "both" request would be
+  // silently swallowed instead of shown to the user.
+  const primaryResult = requestType === "both" ? result.calories : result;
+
+  if (!primaryResult?.ok) {
+    if (primaryResult?.errorCode === "UNSAFE_CONDITION") {
+      await sock.sendMessage(from, { text: primaryResult.message });
+      return;
+    }
+
+    // By this point every field was already validated as present AND
+    // plausible by parseNutritionProfileFields() before ever reaching
+    // here (see its present/valid/absent distinction), so this path
+    // should be genuinely unreachable in normal operation — a required
+    // field that IS present but fails validation here can only mean
+    // corrupted/unexpected stored data. Log the exact error so it can be
+    // investigated, rather than telling the user their input was invalid
+    // (it wasn't — theirs was already validated at parse time).
+    console.log("NUTRITION TARGET UNEXPECTED CALCULATION FAILURE", {
+      requestType,
+      errorCode: primaryResult?.errorCode,
+      profile,
+    });
+    await sock.sendMessage(from, {
+      text: "הייתה לי תקלה בחישוב. אפשר לנסות שוב עוד רגע?",
+    });
+    return;
+  }
+
+  logNutritionTargetCalculation({ requestType, profile, fieldSources, missingFields: [], result });
+
+  const replyText =
+    requestType === "both"
+      ? [
+          result.protein?.ok ? formatNutritionTargetReplyHebrew(result.protein) : null,
+          result.calories?.ok ? formatNutritionTargetReplyHebrew(result.calories) : null,
+        ]
+          .filter(Boolean)
+          .join("\n\n---\n\n")
+      : formatNutritionTargetReplyHebrew(result);
+
+  await sock.sendMessage(from, { text: replyText });
+
+  // No persistence here: every turn that yielded new info has already
+  // saved it immediately, in startNutritionTargetFlow /
+  // handleNutritionTargetInfoInput — see the module comment above for why
+  // incremental, per-turn persistence (rather than only-at-completion) is
+  // required to avoid losing a correction if the flow is abandoned.
+}
+
+// A single, explicit merge call site for this flow: given the two stored
+// layers plus the in-session pending layer plus whatever was parsed from
+// the current message, returns the effective profile AND a source map
+// (nutrition-targets.service.js's mergeNutritionProfile — last-write-wins,
+// current message always highest priority). `safetyContext` is appended
+// separately since it's a free-text accumulator, not a scalar field.
+function buildEffectiveNutritionProfile({ webProfile, storedTargetProfile, pendingProfile, currentMessageProfile, priorSafetyContext, cleanText }) {
+  const { profile, fieldSources } = mergeNutritionProfile({
+    webProfile,
+    storedTargetProfile,
+    pendingProfile,
+    currentMessageProfile,
+  });
+  profile.safetyContext = [priorSafetyContext, cleanText].filter(Boolean).join(" | ");
+  return { profile, fieldSources };
+}
+
+// Turns invalidFields (from parseNutritionProfileFields) into the specific
+// Hebrew explanations defined in nutrition-targets.service.js — never a
+// generic "couldn't calculate" message. Returns "" if nothing to report.
+function buildInvalidFieldsMessage(invalidFields = {}) {
+  const messages = Object.keys(invalidFields)
+    .map((field) => getInvalidFieldMessage(field))
+    .filter(Boolean);
+  return messages.join("\n\n");
+}
+
+async function startNutritionTargetFlow({ sock, from, resolvedPhone, cleanText, messageId }) {
+  const { requestType } = detectNutritionTargetRequest(cleanText);
+  const { webProfile, storedTargetProfile, safetyContext } = await getStoredNutritionProfileLayers(resolvedPhone);
+  const { fields: currentMessageProfile, invalidFields } = parseNutritionProfileFields(cleanText);
+
+  const { profile: mergedProfile, fieldSources } = buildEffectiveNutritionProfile({
+    webProfile,
+    storedTargetProfile,
+    pendingProfile: {},
+    currentMessageProfile,
+    priorSafetyContext: safetyContext,
+    cleanText,
+  });
+
+  // Age plays no part in this check — only explicit safety keywords
+  // (pregnancy, breastfeeding, kidney/liver disease, eating disorder).
+  const unsafeReasons = detectUnsafeConditions({ freeText: mergedProfile.safetyContext });
+
+  if (unsafeReasons.length) {
+    await sock.sendMessage(from, { text: getUnsafeConditionMessage(unsafeReasons) });
+    return;
+  }
+
+  // Persist whatever the user just told us immediately — a value from the
+  // current message must never be lost even if the flow is abandoned.
+  // Only VALID fields are ever in currentMessageProfile; a rejected value
+  // (see invalidFields) is never merged or saved.
+  await saveTargetProfileFields(resolvedPhone, currentMessageProfile, { messageId });
+
+  const invalidMessage = buildInvalidFieldsMessage(invalidFields);
+  const requiredFields = requiredNutritionFieldsForRequestType(requestType);
+  const missingFields = getMissingNutritionTargetFields(mergedProfile, requiredFields);
+
+  if (!missingFields.length) {
+    await respondWithNutritionTargetResult({
+      sock,
+      from,
+      resolvedPhone,
+      requestType,
+      profile: mergedProfile,
+      fieldSources,
+      messageId,
+    });
+    return;
+  }
+
+  pending.set(from, {
+    step: "awaiting_nutrition_target_info",
+    requestType,
+    // Fields collected so far THIS session — merged as the "pending" layer
+    // (below the current message, above stored/web) on every future turn.
+    pendingProfile: currentMessageProfile,
+    missingFields,
+    createdAt: Date.now(),
+  });
+
+  const questionText = buildMissingFieldsQuestion(missingFields, requestType);
+  await sock.sendMessage(from, {
+    text: invalidMessage ? `${invalidMessage}\n\n${questionText}` : questionText,
+  });
+}
+
+async function handleNutritionTargetInfoInput({ sock, from, resolvedPhone, cleanText, pendingEntry, messageId }) {
+  if (isCancellationMessage(cleanText)) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: "בסדר, לא נמשיך עם החישוב כרגע." });
+    return;
+  }
+
+  const { requestType, pendingProfile, missingFields } = pendingEntry;
+
+  // When exactly one field remains, interpret a bare terse reply ("170",
+  // "17") in that field's context (parseSingleFieldAnswerResult falls back
+  // to a bare-number reading when the general parser finds nothing). This
+  // is also where an out-of-range bare reply ("17" for height) is caught
+  // and reported specifically, instead of being silently dropped.
+  let currentMessageProfile = {};
+  let invalidFieldMessages = [];
+
+  if (missingFields.length === 1) {
+    const field = missingFields[0];
+    const result = parseSingleFieldAnswerResult(field, cleanText);
+    if (result.valid) {
+      currentMessageProfile = { [field]: result.value };
+    } else if (result.present) {
+      const specificMessage = getInvalidFieldMessage(field);
+      if (specificMessage) invalidFieldMessages.push(specificMessage);
+    }
+  } else {
+    const parsed = parseNutritionProfileFields(cleanText);
+    currentMessageProfile = parsed.fields;
+    invalidFieldMessages = Object.keys(parsed.invalidFields)
+      .map((invalidField) => getInvalidFieldMessage(invalidField))
+      .filter(Boolean);
+  }
+
+  // Re-read the stored layers fresh on every turn (not a snapshot from when
+  // the flow started) so a correction saved mid-session — e.g. via
+  // handleStandaloneProfileUpdate() — is picked up immediately rather than
+  // being shadowed by stale data captured at flow start.
+  const { webProfile, storedTargetProfile, safetyContext } = await getStoredNutritionProfileLayers(resolvedPhone);
+
+  const { profile: mergedProfile, fieldSources } = buildEffectiveNutritionProfile({
+    webProfile,
+    storedTargetProfile,
+    pendingProfile,
+    currentMessageProfile,
+    priorSafetyContext: safetyContext,
+    cleanText,
+  });
+
+  // Age plays no part in this check — only explicit safety keywords
+  // (pregnancy, breastfeeding, kidney/liver disease, eating disorder).
+  const unsafeReasons = detectUnsafeConditions({ freeText: mergedProfile.safetyContext });
+
+  if (unsafeReasons.length) {
+    pending.delete(from);
+    await sock.sendMessage(from, { text: getUnsafeConditionMessage(unsafeReasons) });
+    return;
+  }
+
+  await saveTargetProfileFields(resolvedPhone, currentMessageProfile, { messageId });
+
+  const requiredFields = requiredNutritionFieldsForRequestType(requestType);
+  const stillMissing = getMissingNutritionTargetFields(mergedProfile, requiredFields);
+
+  if (stillMissing.length) {
+    // A mid-flow reply that itself reads as a coherent nutrition-target
+    // request (e.g. the user simply re-asks "כמה קלוריות אני צריכה
+    // ביום?" again) is not gibberish — it just didn't add any new field.
+    // Only prefix "לא הבנתי" when the reply is neither a recognized new
+    // field NOR a recognizable restatement of the request itself.
+    const isRecognizableRestatement = detectNutritionTargetRequest(cleanText).isNutritionTargetRequest;
+    const understoodNothingNew =
+      Object.keys(currentMessageProfile).length === 0 &&
+      invalidFieldMessages.length === 0 &&
+      !isRecognizableRestatement;
+    const questionText = buildMissingFieldsQuestion(stillMissing, requestType);
+
+    let text;
+    if (invalidFieldMessages.length) {
+      text = `${invalidFieldMessages.join("\n\n")}\n\n${questionText}`;
+    } else if (understoodNothingNew) {
+      text = `לא הבנתי את התשובה.\n\n${questionText}`;
+    } else {
+      text = questionText;
+    }
+
+    await sock.sendMessage(from, { text });
+
+    pending.set(from, {
+      ...pendingEntry,
+      pendingProfile: { ...pendingProfile, ...currentMessageProfile },
+      missingFields: stillMissing,
+    });
+    return;
+  }
+
+  pending.delete(from);
+  await respondWithNutritionTargetResult({
+    sock,
+    from,
+    resolvedPhone,
+    requestType,
+    profile: mergedProfile,
+    fieldSources,
+    messageId,
+  });
+}
+
+// ---------------------------------------------------------------------
+// Standalone profile-update handler: catches a bare corrective statement
+// sent OUTSIDE any active nutrition-target flow (e.g. "אני שוקלת 65" on its
+// own, with no active `pending` entry and no full calculation request) —
+// including one that's INVALID ("גובה 17", "אני שוקלת 600"), which must
+// also be intercepted here rather than falling through to generic chat.
+//
+// This is the fix for a real reported bug: such a message previously
+// matched no routing pattern at all, so it fell through to the
+// unconstrained generic chat function (generateReply), which could
+// fabricate a "saved!"/"the height was saved" confirmation without ever
+// writing to userMemories/{phone}.profile.targetProfile — the user's
+// corrected value was silently lost, and the next calculation either used
+// the old stored value or failed outright with a generic error.
+//
+// Deliberately requires at least one of weightKg / heightCm / activityLevel
+// / goal — as a valid OR a rejected-invalid attempt — to trigger; a bare
+// `sex`-only parse is NOT enough on its own, since incidental
+// grammatically-gendered phrasing unrelated to this feature (e.g. "אני בת
+// 25 גרה בתל אביב") would otherwise be misdetected as a profile-update
+// message. `sex` is still saved if it co-occurs with a genuine trigger
+// field.
+//
+// A field is NEVER reported as saved unless saveTargetProfileFields()
+// verified it round-tripped through Firestore — see that function's
+// `savedFields` return value, which is what confirmedLines below is built
+// from, not the raw parsed input.
+// ---------------------------------------------------------------------
+const STANDALONE_PROFILE_UPDATE_TRIGGER_FIELDS = ["weightKg", "heightCm", "activityLevel", "goal"];
+
+function isStandaloneProfileUpdateMessage(fields, invalidFields) {
+  return STANDALONE_PROFILE_UPDATE_TRIGGER_FIELDS.some(
+    (field) => fields[field] !== undefined || invalidFields[field] !== undefined
+  );
+}
+
+const PROFILE_FIELD_CONFIRMATION_LABEL_HEBREW = {
+  weightKg: (v) => `משקל: ${v} ק"ג`,
+  heightCm: (v) => `גובה: ${v} ס"מ`,
+  activityLevel: (v) => `רמת פעילות: ${ACTIVITY_LEVEL_SHORT_LABEL_HEBREW[v] || v}`,
+  sex: () => null, // sex is saved but not surfaced in the confirmation line
+  goal: () => null, // goal is saved but not surfaced in the confirmation line
+};
+
+async function handleStandaloneProfileUpdate({ sock, from, resolvedPhone, cleanText, messageId }) {
+  const { fields, invalidFields } = parseNutritionProfileFields(cleanText);
+  if (!isStandaloneProfileUpdateMessage(fields, invalidFields)) return false;
+
+  const hasFieldsToSave = Object.keys(fields).length > 0;
+  const saveResult = hasFieldsToSave
+    ? await saveTargetProfileFields(resolvedPhone, fields, { messageId })
+    : { ok: true, savedFields: {} };
+
+  const parts = [];
+
+  if (Object.keys(saveResult.savedFields).length) {
+    const confirmedLines = Object.entries(saveResult.savedFields)
+      .map(([field, value]) => PROFILE_FIELD_CONFIRMATION_LABEL_HEBREW[field]?.(value) || null)
+      .filter(Boolean);
+
+    parts.push(
+      confirmedLines.length
+        ? `עדכנתי את הנתונים שלך:\n${confirmedLines.map((line) => `• ${line}`).join("\n")}`
+        : "עדכנתי את הנתונים שלך."
+    );
+  } else if (hasFieldsToSave && !saveResult.ok) {
+    // Parsed and validated, but the write couldn't be verified — never
+    // claim it was saved when it wasn't.
+    parts.push("לא הצלחתי לשמור את הנתונים כרגע. אפשר לנסות שוב עוד רגע?");
+  }
+
+  const invalidMessage = buildInvalidFieldsMessage(invalidFields);
+  if (invalidMessage) parts.push(invalidMessage);
+
+  await sock.sendMessage(from, { text: parts.join("\n\n") });
+  return true;
+}
+
+// =====================
 // Express
 // =====================
 app.use(express.static(path.join(__dirname, "public")));
@@ -1745,9 +2341,11 @@ app.get("/", (req, res) => {
   res.send(html);
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Web running: http://localhost:${PORT}`);
-});
+if (isMainModule) {
+  app.listen(PORT, () => {
+    console.log(`✅ Web running: http://localhost:${PORT}`);
+  });
+}
 
 // =====================
 // Memory
@@ -1925,29 +2523,15 @@ async function generateReply(
 - שמרי על שפה טבעית ושיחתית בעברית.
 - לעולם אל תחשפי למשתמש את מבנה הזיכרון הפנימי.
 - אל תתני ייעוץ רפואי.
+- לעולם אל תחשבי או תמציאי בעצמך יעד קלורי אישי או כמות חלבון אישית מדויקת - אלו מחושבים אך ורק על ידי שירות ייעודי באפליקציה. אם המשתמש/ת שואל/ת "כמה קלוריות/חלבון אני צריכה ביום", או מביע/ה רצון לרדת/לעלות/לשמור על המשקל, בקשי ממנה לשאול/לכתוב זאת כפי שהיא/הוא כתב/ה - הבקשה תטופל אוטומטית על ידי האפליקציה, ואל תנחשי מספר בעצמך.
+- לעולם אל תשאלי את המשתמש/ת על גיל, ולעולם אל תזכירי גיל 18, "מתחת לגיל 18", "מעל גיל 18", "קטין/ה" או "מבוגר/ת" בשום הקשר של חישוב תזונתי - זה לא רלוונטי לאף חלק בתהליך הזה ואסור לך להעלות את הנושא בעצמך מכל סיבה.
+- לעולם אל תטעני או תרמזי ששמרת, עדכנת או תיעדת נתון כלשהו על המשתמש/ת (משקל, גובה, מין, רמת פעילות, מטרה, או כל פרט אישי אחר) - את/ה לא שומר/ת נתונים כאלה בעצמך בשום מקרה. עדכון נתונים כאלה מתבצע אך ורק דרך תהליך ייעודי באפליקציה, שאמור היה לתפוס הודעות כאלה לפני שהן מגיעות אלייך; אם בכל זאת הגיעה אלייך הודעה כזו, הגיבי בטבעיות בלי לטעון ששמרת משהו.
+- לעולם אל תפתחי או תמשיכי בעצמך שיחה מובנית לאיסוף פרטים לצורך חישוב יעד קלורי/חלבון (כלומר אל תשאלי ברצף על משקל, גובה, מין ורמת פעילות כדי לחשב עבור המשתמש/ת) - זהו תהליך נפרד וייעודי באפליקציה.
 
 החזירי תמיד ורק JSON תקין במבנה הבא:
 {
-  "reply": "string",
-  "shouldSaveMemory": boolean,
-  "memoryUpdate": {
-    "height": 0,
-    "weight": 0,
-    "goalWeight": 0,
-    "activityLevel": "",
-    "dietPreferences": [],
-    "allergies": [],
-    "likedFoods": [],
-    "dislikedFoods": [],
-    "notes": ""
-  }
+  "reply": "string"
 }
-
-כללים לשמירת זיכרון:
-- shouldSaveMemory=true רק אם המשתמש/ת נתן/ה מידע יציב וארוך-טווח.
-- לשמור רק שדות מתוך: height, weight, goalWeight, activityLevel, dietPreferences, allergies, likedFoods, dislikedFoods, notes.
-- לא לשמור מידע זמני, חד-פעמי, רעב רגעי, ארוחה של היום, מצב רוח רגעי.
-- אם אין עדכון זיכרון: shouldSaveMemory=false ו-memoryUpdate={}.
 `.trim(),
     },
     {
@@ -1979,22 +2563,14 @@ ${String(userText || "").trim()}
 
   if (!parsed || typeof parsed !== "object") {
     return {
-      reply:
-        rawContent ||
-        "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
-      shouldSaveMemory: false,
-      memoryUpdate: null,
+      reply: rawContent || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
     };
   }
 
   const reply = String(parsed.reply || "").trim();
-  const memoryUpdate = sanitizeMemoryUpdate(parsed.memoryUpdate || {});
-  const shouldSaveMemory = Boolean(parsed.shouldSaveMemory) && Boolean(memoryUpdate);
 
   return {
     reply: reply || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
-    shouldSaveMemory,
-    memoryUpdate,
   };
 }
 
@@ -2021,11 +2597,7 @@ async function generateReplyWithNutritionKnowledge(
     });
 
     if (!nutritionResult.shouldUseDefaultFlow && nutritionResult.answer) {
-      return {
-        reply: nutritionResult.answer,
-        shouldSaveMemory: false,
-        memoryUpdate: null,
-      };
+      return { reply: nutritionResult.answer };
     }
   }
 
@@ -2315,12 +2887,12 @@ async function startBot() {
           }
 
           const pendingStepBeforeImage = pending.get(from)?.step || null;
+          const shouldClassifyImage =
+            !barcodeDecodeResult.found &&
+            !isBarcodeModeActive({ pendingStep: pendingStepBeforeImage, captionText: text });
 
           let packagedProductClassification = null;
-          if (
-            !barcodeDecodeResult.found &&
-            !isBarcodeModeActive({ pendingStep: pendingStepBeforeImage, captionText: text })
-          ) {
+          if (shouldClassifyImage) {
             try {
               const classifyResult = await classifyPackagedProductImage(buffer);
               packagedProductClassification = classifyResult.classification;
@@ -2331,11 +2903,32 @@ async function startBot() {
             }
           }
 
+          // Only need the separate food/non-food judgment when the image
+          // isn't already a recognized packaged product (that's already
+          // food-related by definition, and barcode detection above always
+          // takes priority regardless).
+          let isFoodImage = null;
+          let foodConfidence = null;
+          if (shouldClassifyImage && packagedProductClassification !== "PACKAGED_PRODUCT") {
+            try {
+              const foodClassifyResult = await classifyFoodImage(buffer);
+              isFoodImage = foodClassifyResult.isFoodImage;
+              foodConfidence = foodClassifyResult.foodConfidence;
+            } catch (foodClassifyError) {
+              console.log("FOOD IMAGE CLASSIFICATION FAILED", {
+                error: foodClassifyError?.code || "classification_error",
+              });
+            }
+          }
+
           const imageBarcodeRoute = resolveImageBarcodeRouting({
             barcodeFound: barcodeDecodeResult.found,
             pendingStep: pendingStepBeforeImage,
             captionText: text,
             packagedProductClassification,
+            isFoodImage,
+            foodConfidence,
+            foodConfidenceThreshold: FOOD_IMAGE_MIN_CONFIDENCE,
           });
 
           if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.PRODUCT_FLOW) {
@@ -2355,6 +2948,20 @@ async function startBot() {
             pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
             addToHistory(resolvedPhone, "user", text ? `[תמונת מוצר ארוז] ${text}` : "[תמונת מוצר ארוז]");
             await sock.sendMessage(from, { text: PACKAGED_PRODUCT_DETECTED_HEBREW });
+            return;
+          }
+
+          if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.NON_FOOD) {
+            // No meal is estimated, no pending meal state is created, and
+            // Open Food Facts is never called for a non-food image.
+            addToHistory(resolvedPhone, "user", text ? `[תמונה שאינה מזון] ${text}` : "[תמונה שאינה מזון]");
+            await sock.sendMessage(from, { text: NON_FOOD_IMAGE_HEBREW });
+            return;
+          }
+
+          if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.LOW_CONFIDENCE_FOOD) {
+            addToHistory(resolvedPhone, "user", text ? `[תמונה לא ברורה] ${text}` : "[תמונה לא ברורה]");
+            await sock.sendMessage(from, { text: LOW_CONFIDENCE_FOOD_IMAGE_HEBREW });
             return;
           }
 
@@ -2449,6 +3056,18 @@ ${clarificationQuestion}`,
             return;
           }
 
+          if (p?.step === "awaiting_nutrition_target_info") {
+            await handleNutritionTargetInfoInput({
+              sock,
+              from,
+              resolvedPhone,
+              cleanText,
+              pendingEntry: p,
+              messageId: msg?.key?.id || "",
+            });
+            return;
+          }
+
           if (!p && shouldStartProductLookup(cleanText)) {
             await startProductLookupFlow({ sock, from, cleanText });
             return;
@@ -2514,6 +3133,28 @@ ${clarificationQuestion}`,
             });
 
             return;
+          }
+
+          if (!p && detectNutritionTargetRequest(cleanText).isNutritionTargetRequest) {
+            await startNutritionTargetFlow({
+              sock,
+              from,
+              resolvedPhone,
+              cleanText,
+              messageId: msg?.key?.id || "",
+            });
+            return;
+          }
+
+          if (!p) {
+            const handledAsStandaloneProfileUpdate = await handleStandaloneProfileUpdate({
+              sock,
+              from,
+              resolvedPhone,
+              cleanText,
+              messageId: msg?.key?.id || "",
+            });
+            if (handledAsStandaloneProfileUpdate) return;
           }
 
           addToHistory(resolvedPhone, "user", cleanText);
@@ -2618,4 +3259,21 @@ ${clarificationQuestion}`,
   }
 }
 
-startBot();
+if (isMainModule) {
+  startBot();
+}
+
+// Exported ONLY for integration testing (see integration/*.test.js), which
+// imports this module with `./firebase-admin.js` and
+// `./services/memory.service.js` mocked via mock.module(), a fake `sock`
+// object (just needs sendMessage(to, {text})), and isMainModule guarding
+// app.listen()/startBot() so importing this file never binds a port or
+// starts a real WhatsApp connection.
+export {
+  pending,
+  startNutritionTargetFlow,
+  handleNutritionTargetInfoInput,
+  handleStandaloneProfileUpdate,
+  getStoredNutritionProfileLayers,
+  saveTargetProfileFields,
+};
