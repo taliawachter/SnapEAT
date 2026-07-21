@@ -27,6 +27,8 @@ bot/auth_info/
 bot/auth_info_baileys/
 **/auth_info/
 **/auth_info_baileys/
+auth_info 
+auth_info_old/
 
 # Runtime-generated files
 uploads/
@@ -58,7 +60,7 @@ bot/coverage/
 # Generated evaluation reports
 evaluation/reports/
 
-
+Chapter-6-Evidence/
 
 
 printf "\n# Secrets and local authentication\n.env\nfirebase-service-account.json\nauth_info/\nuploads/\n" >> .gitignore

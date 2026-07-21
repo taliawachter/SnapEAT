@@ -2842,10 +2842,14 @@ async function startBot() {
         return;
       }
 
-      if (!ALLOWED_NUMBERS.has(resolvedPhone)) {
-        console.log(`SKIP: phone not allowed (${resolvedPhone})`);
-        return;
-      }
+      if (
+  ALLOWED_NUMBERS.size > 0 &&
+  !ALLOWED_NUMBERS.has(resolvedPhone)
+) {
+  console.log(`SKIP: phone not allowed (${resolvedPhone})`);
+  return;
+}
+
 
       if (resolvedPhone === BOT_NUMBER) {
         console.log("⏭️  Skip: Bot's own message");
