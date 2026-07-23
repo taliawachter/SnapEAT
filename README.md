@@ -1,16 +1,170 @@
-# React + Vite
+# 🍽️ SnapEat – AI Nutrition Assistant
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+SnapEat is an AI-powered nutrition assistant that helps users analyze meals, track nutrition, and receive personalized dietary guidance.
 
-Currently, two official plugins are available:
+The system combines computer vision, barcode recognition, conversational AI, and long-term memory to create an intelligent nutrition companion.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+---
 
-## React Compiler
+## ✨ Features
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+* 📸 Meal analysis from images using AI
+* 🥗 Automatic calorie and macronutrient estimation
+* 📦 Barcode scanning for packaged food products
+* 💬 AI-powered nutrition chatbot
+* 🧠 Long-term conversation memory
+* 📚 Retrieval-Augmented Generation (RAG) knowledge base
+* ❤️ Save meals to personal history
+* 🔐 Secure Firebase Authentication (Google Sign-In)
+* ☁️ Firebase Firestore integration
+* 📱 Responsive React interface
+* 🤖 WhatsApp Bot integration
 
-## Expanding the ESLint configuration
+---
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+# 🏗️ Architecture
+
+```
+React Frontend
+        │
+        ▼
+Firebase Authentication
+        │
+        ▼
+Express / Node.js Backend
+        │
+ ┌──────┴──────────────┐
+ │                     │
+ ▼                     ▼
+OpenAI API        Firebase Firestore
+ │                     │
+ ▼                     ▼
+Meal Analysis     User Data & Memory
+ │
+ ▼
+Nutrition Results
+```
+
+The WhatsApp Bot communicates with the backend and uses the same AI services, memory system, and nutrition knowledge base.
+
+---
+
+# 🛠️ Tech Stack
+
+### Frontend
+
+* React
+* JavaScript
+* Vite
+* CSS
+
+### Backend
+
+* Node.js
+* Express
+
+### Database
+
+* Firebase Firestore
+
+### Authentication
+
+* Firebase Authentication
+* Google Sign-In
+
+### AI
+
+* OpenAI API
+* Retrieval-Augmented Generation (RAG)
+* Long-Term Conversation Memory
+
+### External APIs
+
+* Open Food Facts
+* WhatsApp (Baileys)
+
+### Testing
+
+* Node Test Runner
+* Integration Tests
+* Unit Tests
+
+---
+
+# 📂 Project Structure
+
+```
+SnapEat/
+│
+├── src/                  # React application
+├── bot/                  # WhatsApp bot
+├── public/
+├── shared/
+├── server/
+├── tests/
+└── README.md
+```
+
+---
+
+# 🚀 Getting Started
+
+Clone the repository:
+
+```bash
+git clone https://github.com/taliawachter/SnapEAT.git
+cd SnapEAT
+```
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run the React application:
+
+```bash
+npm run dev
+```
+
+The WhatsApp Bot can be started from the **bot** directory after configuring the required environment variables.
+
+---
+
+# 🔒 Environment Variables
+
+Create a `.env` file and configure the required variables.
+
+Example:
+
+```env
+OPENAI_API_KEY=your_api_key
+FIREBASE_API_KEY=your_api_key
+```
+
+Sensitive credentials are intentionally excluded from this repository.
+
+---
+
+# 🎯 Key Capabilities
+
+* AI-powered meal recognition
+* Nutrition estimation
+* Personalized dietary recommendations
+* Persistent conversation memory
+* Context-aware chatbot
+* Barcode product lookup
+* Secure cloud storage
+* Cross-platform architecture
+
+---
+
+# 👩‍💻 Author
+
+**Talia Wachter**
+
+Computer Science Student
+
+GitHub:
+https://github.com/taliawachter
