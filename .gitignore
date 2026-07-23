@@ -18,31 +18,37 @@ dist-ssr/
 
 # Environment variables and secrets
 .env
+.env.*
+!.env.example
 bot/.env
-bot/firebase-service-account.json
+bot/.env.*
+!bot/.env.example
 firebase-service-account.json
+bot/firebase-service-account.json
 
-# WhatsApp / Baileys session files
+# WhatsApp / Baileys authentication files
+auth_info/
+auth_info_old/
+auth_info_baileys/
 bot/auth_info/
 bot/auth_info_baileys/
 **/auth_info/
 **/auth_info_baileys/
-auth_info 
-auth_info_old/
 
 # Runtime-generated files
 uploads/
 bot/uploads/
 bot/data/
 
-# Generated evaluation reports (regenerate with `npm run evaluation`)
-evaluation/reports/*.json
-
-# Generated test coverage reports (regenerate with `npm run coverage`)
+# Test coverage
 coverage/
 bot/coverage/
 
-# Editor directories and files
+# Generated evaluation reports
+evaluation/reports/
+Chapter-6-Evidence/
+
+# Editor and operating-system files
 .vscode/*
 !.vscode/extensions.json
 .idea/
@@ -52,15 +58,3 @@ bot/coverage/
 *.njsproj
 *.sln
 *.sw?
-
-# Coverage reports
-coverage/
-bot/coverage/
-
-# Generated evaluation reports
-evaluation/reports/
-
-Chapter-6-Evidence/
-
-
-printf "\n# Secrets and local authentication\n.env\nfirebase-service-account.json\nauth_info/\nuploads/\n" >> .gitignore
