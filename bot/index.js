@@ -87,12 +87,8 @@ import {
   classifyFoodImage,
   FOOD_IMAGE_MIN_CONFIDENCE,
 } from "./services/packaged-product-image.service.js";
-import {
-  getGreetingReply,
-  getOutOfScopeReply,
-  isGreetingMessage,
-  isNutritionRelatedMessage,
-} from "./services/scope-guard.service.js";
+import { getOutOfScopeReply, isGreetingMessage, isNutritionRelatedMessage } from "./services/scope-guard.service.js";
+import { getGreetingResponseForUser } from "./services/greeting-welcome.service.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1136,6 +1132,31 @@ async function getUserByPhone(phone) {
     ...snapshot.docs[0].data(),
   };
 }
+
+async function readWelcomeMessageFlag(phone) {
+  const user = await getUserByPhone(phone);
+  if (!user?.id) {
+    return null;
+  }
+
+  const userDoc = await db.collection("users").doc(user.id).get();
+  return Boolean(userDoc?.data()?.welcomeMessageSent);
+}
+
+async function saveWelcomeMessageFlag(phone, value) {
+  const user = await getUserByPhone(phone);
+  if (!user?.id) {
+    return false;
+  }
+
+  await db.collection("users").doc(user.id).set(
+    { welcomeMessageSent: Boolean(value) },
+    { merge: true }
+  );
+
+  return true;
+}
+
 async function saveMealEntry({
   phone,
   mealNote = "",
@@ -3475,9 +3496,19 @@ ${clarificationQuestion}` }, reason: "meal_analysis_clarification", eventId: msg
           }
 
           const pendingState = pending.get(from) || null;
-          if (!pendingState && isGreetingMessage(cleanText)) {
+          const greetingResult = await getGreetingResponseForUser({
+            phone: resolvedPhone,
+            text: cleanText,
+            pendingState,
+            storage: {
+              readWelcomeFlag: readWelcomeMessageFlag,
+              saveWelcomeFlag: saveWelcomeMessageFlag,
+            },
+          });
+
+          if (greetingResult.shouldReply) {
             addToHistory(resolvedPhone, "user", cleanText);
-            const reply = getGreetingReply();
+            const reply = greetingResult.reply;
             await sendReply({ recipient: from, content: { text: reply }, reason: "greeting_reply", eventId: msg?.key?.id || null });
             addToHistory(resolvedPhone, "assistant", reply);
             return;
