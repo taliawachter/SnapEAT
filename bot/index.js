@@ -87,6 +87,12 @@ import {
   classifyFoodImage,
   FOOD_IMAGE_MIN_CONFIDENCE,
 } from "./services/packaged-product-image.service.js";
+import {
+  getGreetingReply,
+  getOutOfScopeReply,
+  isGreetingMessage,
+  isNutritionRelatedMessage,
+} from "./services/scope-guard.service.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1314,7 +1320,7 @@ async function startProductLookupFlow({ sock, from, cleanText }) {
 
   if (!candidate) {
     pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
-    await sock.sendMessage(from, { text: BARCODE_MODE_ACTIVATED_HEBREW });
+    await sendReply({ recipient: from, content: { text: BARCODE_MODE_ACTIVATED_HEBREW }, reason: "barcode_mode_activated" });
     return;
   }
 
@@ -1327,19 +1333,19 @@ async function lookupAndRespondWithProduct({ sock, from, barcode }) {
   if (!result.found) {
     if (result.errorCode === "PRODUCT_LOOKUP_FAILED") {
       pending.delete(from);
-      await sock.sendMessage(from, { text: PRODUCT_LOOKUP_UNAVAILABLE_HEBREW });
+      await sendReply({ recipient: from, content: { text: PRODUCT_LOOKUP_UNAVAILABLE_HEBREW }, reason: "product_lookup_unavailable" });
       return;
     }
 
     if (result.errorCode === "PRODUCT_NOT_FOUND") {
       pending.delete(from);
-      await sock.sendMessage(from, { text: PRODUCT_NOT_FOUND_HEBREW });
+      await sendReply({ recipient: from, content: { text: PRODUCT_NOT_FOUND_HEBREW }, reason: "product_not_found" });
       return;
     }
 
     // Invalid barcode format/length — let the user retry rather than failing hard.
     pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
-    await sock.sendMessage(from, { text: INVALID_BARCODE_HEBREW });
+    await sendReply({ recipient: from, content: { text: INVALID_BARCODE_HEBREW }, reason: "invalid_barcode" });
     return;
   }
 
@@ -1347,18 +1353,18 @@ async function lookupAndRespondWithProduct({ sock, from, barcode }) {
 
   if (!hasUsableCoreNutrition(product)) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: PRODUCT_INCOMPLETE_HEBREW });
+    await sendReply({ recipient: from, content: { text: PRODUCT_INCOMPLETE_HEBREW }, reason: "product_incomplete" });
     return;
   }
 
   pending.set(from, { step: "awaiting_product_amount", product, createdAt: Date.now() });
-  await sock.sendMessage(from, { text: formatProductNutritionForUser(product) });
+  await sendReply({ recipient: from, content: { text: formatProductNutritionForUser(product) }, reason: "product_nutrition_reply" });
 }
 
 async function handleProductBarcodeInput({ sock, from, cleanText }) {
   if (isCancellationMessage(cleanText)) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: "בסדר, ביטלתי את חיפוש המוצר." });
+    await sendReply({ recipient: from, content: { text: "בסדר, ביטלתי את חיפוש המוצר." }, reason: "product_flow_cancelled" });
     return;
   }
 
@@ -1369,23 +1375,19 @@ async function handleProductBarcodeInput({ sock, from, cleanText }) {
 async function handleProductAmountInput({ sock, from, cleanText, pendingEntry }) {
   if (isCancellationMessage(cleanText)) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: "בסדר, לא הוספתי את המוצר." });
+    await sendReply({ recipient: from, content: { text: "בסדר, לא הוספתי את המוצר." }, reason: "product_flow_cancelled" });
     return;
   }
 
   const parsed = parseProductAmountInput(cleanText);
 
   if (parsed.type === "unsupported_unit") {
-    await sock.sendMessage(from, {
-      text: "כדי לחשב בצורה אמינה אני צריכה משקל בגרמים, או חלק מהאריזה אם משקל האריזה ידוע.",
-    });
+    await sendReply({ recipient: from, content: { text: "כדי לחשב בצורה אמינה אני צריכה משקל בגרמים, או חלק מהאריזה אם משקל האריזה ידוע." }, reason: "unsupported_unit" });
     return;
   }
 
   if (parsed.type === "ambiguous") {
-    await sock.sendMessage(from, {
-      text: "לא הבנתי כמה נאכל. אפשר לכתוב, למשל: 125 גרם, חצי אריזה, או אריזה שלמה.",
-    });
+    await sendReply({ recipient: from, content: { text: "לא הבנתי כמה נאכל. אפשר לכתוב, למשל: 125 גרם, חצי אריזה, או אריזה שלמה." }, reason: "ambiguous_amount" });
     return;
   }
 
@@ -1397,20 +1399,16 @@ async function handleProductAmountInput({ sock, from, cleanText, pendingEntry })
 
   if (!calcResult.ok) {
     if (calcResult.errorCode === "PACKAGE_WEIGHT_IS_VOLUME") {
-      await sock.sendMessage(from, { text: PACKAGE_WEIGHT_IS_VOLUME_HEBREW });
+      await sendReply({ recipient: from, content: { text: PACKAGE_WEIGHT_IS_VOLUME_HEBREW }, reason: "package_weight_volume" });
       return;
     }
 
     if (calcResult.errorCode === "UNKNOWN_PACKAGE_WEIGHT") {
-      await sock.sendMessage(from, {
-        text: "לא ידוע לי משקל האריזה של המוצר הזה, ולכן אי אפשר לחשב לפי חלק מהאריזה. אפשר לכתוב כמות בגרמים?",
-      });
+      await sendReply({ recipient: from, content: { text: "לא ידוע לי משקל האריזה של המוצר הזה, ולכן אי אפשר לחשב לפי חלק מהאריזה. אפשר לכתוב כמות בגרמים?" }, reason: "unknown_package_weight" });
       return;
     }
 
-    await sock.sendMessage(from, {
-      text: "הכמות שכתבת לא תקינה. אפשר לכתוב מספר גרמים סביר, או חלק מהאריזה?",
-    });
+    await sendReply({ recipient: from, content: { text: "הכמות שכתבת לא תקינה. אפשר לכתוב מספר גרמים סביר, או חלק מהאריזה?" }, reason: "invalid_amount" });
     return;
   }
 
@@ -1421,20 +1419,18 @@ async function handleProductAmountInput({ sock, from, cleanText, pendingEntry })
     createdAt: Date.now(),
   });
 
-  await sock.sendMessage(from, {
-    text: formatProductConfirmationSummary(product, calcResult.result),
-  });
+  await sendReply({ recipient: from, content: { text: formatProductConfirmationSummary(product, calcResult.result) }, reason: "product_confirmation_prompt" });
 }
 
 async function handleProductConfirmationInput({ sock, from, cleanText, pendingEntry }) {
   if (isCancellationMessage(cleanText)) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: "בסדר, לא הוספתי את המוצר." });
+    await sendReply({ recipient: from, content: { text: "בסדר, לא הוספתי את המוצר." }, reason: "product_flow_cancelled" });
     return;
   }
 
   if (!isPositiveConfirmation(cleanText)) {
-    await sock.sendMessage(from, { text: "אפשר לענות כן או לא?" });
+    await sendReply({ recipient: from, content: { text: "אפשר לענות כן או לא?" }, reason: "confirmation_prompt" });
     return;
   }
 
@@ -1445,24 +1441,20 @@ async function handleProductConfirmationInput({ sock, from, cleanText, pendingEn
     createdAt: Date.now(),
   });
 
-  await sock.sendMessage(from, {
-    text: "איזו ארוחה זו הייתה?\nכתבי רק אחת מהאפשרויות:\nבוקר\nצהריים\nערב\nביניים",
-  });
+  await sendReply({ recipient: from, content: { text: "איזו ארוחה זו הייתה?\nכתבי רק אחת מהאפשרויות:\nבוקר\nצהריים\nערב\nביניים" }, reason: "product_meal_type_prompt" });
 }
 
 async function handleProductMealTypeInput({ sock, from, resolvedPhone, cleanText, pendingEntry }) {
   if (isCancellationMessage(cleanText)) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: "בסדר, לא הוספתי את המוצר." });
+    await sendReply({ recipient: from, content: { text: "בסדר, לא הוספתי את המוצר." }, reason: "product_flow_cancelled" });
     return;
   }
 
   const mealType = normalizeMealType(cleanText);
 
   if (!mealType) {
-    await sock.sendMessage(from, {
-      text: "לא הבנתי את סוג הארוחה.\nכתבי רק:\nבוקר\nצהריים\nערב\nביניים",
-    });
+    await sendReply({ recipient: from, content: { text: "לא הבנתי את סוג הארוחה.\nכתבי רק:\nבוקר\nצהריים\nערב\nביניים" }, reason: "meal_type_unknown" });
     return;
   }
 
@@ -1475,11 +1467,7 @@ async function handleProductMealTypeInput({ sock, from, resolvedPhone, cleanText
 
   pending.delete(from);
 
-  await sock.sendMessage(from, {
-    text: saved
-      ? "✅ המוצר נוסף לארוחה ונשמר ביומן"
-      : "לא מצאתי משתמש באתר עם מספר הטלפון הזה. תוודאי שבאתר נשמר אותו מספר טלפון בדיוק.",
-  });
+  await sendReply({ recipient: from, content: { text: saved ? "✅ המוצר נוסף לארוחה ונשמר ביומן" : "לא מצאתי משתמש באתר עם מספר הטלפון הזה. תוודאי שבאתר נשמר אותו מספר טלפון בדיוק." }, reason: "product_saved" });
 }
 
 // =====================
@@ -1764,7 +1752,7 @@ async function respondWithNutritionTargetResult({
 
   if (!primaryResult?.ok) {
     if (primaryResult?.errorCode === "UNSAFE_CONDITION") {
-      await sock.sendMessage(from, { text: primaryResult.message });
+      await sendReply({ recipient: from, content: { text: primaryResult.message }, reason: "nutrition_target_unsafe", eventId: messageId || null });
       return;
     }
 
@@ -1781,9 +1769,7 @@ async function respondWithNutritionTargetResult({
       errorCode: primaryResult?.errorCode,
       profile,
     });
-    await sock.sendMessage(from, {
-      text: "הייתה לי תקלה בחישוב. אפשר לנסות שוב עוד רגע?",
-    });
+    await sendReply({ recipient: from, content: { text: "הייתה לי תקלה בחישוב. אפשר לנסות שוב עוד רגע?" }, reason: "nutrition_target_error", eventId: messageId || null });
     return;
   }
 
@@ -1799,7 +1785,7 @@ async function respondWithNutritionTargetResult({
           .join("\n\n---\n\n")
       : formatNutritionTargetReplyHebrew(result);
 
-  await sock.sendMessage(from, { text: replyText });
+  await sendReply({ recipient: from, content: { text: replyText }, reason: "nutrition_target_result", eventId: messageId || null });
 
   // No persistence here: every turn that yielded new info has already
   // saved it immediately, in startNutritionTargetFlow /
@@ -1854,7 +1840,7 @@ async function startNutritionTargetFlow({ sock, from, resolvedPhone, cleanText, 
   const unsafeReasons = detectUnsafeConditions({ freeText: mergedProfile.safetyContext });
 
   if (unsafeReasons.length) {
-    await sock.sendMessage(from, { text: getUnsafeConditionMessage(unsafeReasons) });
+    await sendReply({ recipient: from, content: { text: getUnsafeConditionMessage(unsafeReasons) }, reason: "nutrition_target_unsafe", eventId: messageId || null });
     return;
   }
 
@@ -1892,15 +1878,13 @@ async function startNutritionTargetFlow({ sock, from, resolvedPhone, cleanText, 
   });
 
   const questionText = buildMissingFieldsQuestion(missingFields, requestType);
-  await sock.sendMessage(from, {
-    text: invalidMessage ? `${invalidMessage}\n\n${questionText}` : questionText,
-  });
+  await sendReply({ recipient: from, content: { text: invalidMessage ? `${invalidMessage}\n\n${questionText}` : questionText }, reason: "nutrition_target_followup", eventId: messageId || null });
 }
 
 async function handleNutritionTargetInfoInput({ sock, from, resolvedPhone, cleanText, pendingEntry, messageId }) {
   if (isCancellationMessage(cleanText)) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: "בסדר, לא נמשיך עם החישוב כרגע." });
+    await sendReply({ recipient: from, content: { text: "בסדר, לא נמשיך עם החישוב כרגע." }, reason: "nutrition_target_cancelled", eventId: messageId || null });
     return;
   }
 
@@ -1952,7 +1936,7 @@ async function handleNutritionTargetInfoInput({ sock, from, resolvedPhone, clean
 
   if (unsafeReasons.length) {
     pending.delete(from);
-    await sock.sendMessage(from, { text: getUnsafeConditionMessage(unsafeReasons) });
+    await sendReply({ recipient: from, content: { text: getUnsafeConditionMessage(unsafeReasons) }, reason: "nutrition_target_unsafe", eventId: messageId || null });
     return;
   }
 
@@ -1983,7 +1967,7 @@ async function handleNutritionTargetInfoInput({ sock, from, resolvedPhone, clean
       text = questionText;
     }
 
-    await sock.sendMessage(from, { text });
+    await sendReply({ recipient: from, content: { text }, reason: "nutrition_target_followup", eventId: messageId || null });
 
     pending.set(from, {
       ...pendingEntry,
@@ -2079,7 +2063,7 @@ async function handleStandaloneProfileUpdate({ sock, from, resolvedPhone, cleanT
   const invalidMessage = buildInvalidFieldsMessage(invalidFields);
   if (invalidMessage) parts.push(invalidMessage);
 
-  await sock.sendMessage(from, { text: parts.join("\n\n") });
+  await sendReply({ recipient: from, content: { text: parts.join("\n\n") }, reason: "standalone_profile_update", eventId: messageId || null });
   return true;
 }
 
@@ -2236,6 +2220,45 @@ function serializeTimestampForJson(value) {
   return null;
 }
 
+app.delete("/api/diary/meals/:mealId", async (req, res) => {
+  try {
+    const uid = await getAuthenticatedUid(req);
+    if (!uid) {
+      res.status(401).json({ error: "נדרשת התחברות כדי למחוק ארוחה.", code: "UNAUTHORIZED" });
+      return;
+    }
+
+    const mealId = String(req.params?.mealId || "").trim();
+    if (!mealId) {
+      res.status(400).json({ error: "חסר מזהה ארוחה.", code: "MISSING_MEAL_ID" });
+      return;
+    }
+
+    const mealRef = db.collection("users").doc(uid).collection("meals").doc(mealId);
+    const snapshot = await mealRef.get();
+
+    if (!snapshot.exists) {
+      res.status(404).json({ error: "הארוחה לא נמצאה.", code: "MEAL_NOT_FOUND" });
+      return;
+    }
+
+    await mealRef.delete();
+
+    res.json({
+      success: true,
+      ok: true,
+      id: mealId,
+    });
+  } catch (error) {
+    console.log("MEAL DELETE FAILED", {
+      status: 500,
+      code: "DELETE_MEAL_FAILED",
+    });
+    console.log("❌ meal delete endpoint failed:", error?.message || error);
+    res.status(500).json({ error: "מחיקת הארוחה נכשלה.", code: "DELETE_MEAL_FAILED" });
+  }
+});
+
 app.patch("/api/diary/meals/:mealId", async (req, res) => {
   try {
     const uid = await getAuthenticatedUid(req);
@@ -2356,6 +2379,7 @@ const processedMessageIds = new Map();
 
 const MESSAGE_ID_TTL_MS = 30 * 60 * 1000;
 const BOT_SESSION_STARTED_AT_MS = Date.now();
+const STALE_MESSAGE_GRACE_MS = 60 * 1000;
 
 function pruneProcessedMessageIds(now = Date.now()) {
   for (const [id, ts] of processedMessageIds.entries()) {
@@ -2407,17 +2431,15 @@ function toTimestampMs(rawTs) {
 
 function isStaleInboundMessage(msg) {
   const tsMs = toTimestampMs(msg?.messageTimestamp);
-  if (!tsMs) return true;
+  if (!tsMs) return false;
 
-  // Replayed append history is usually older than the current runtime session.
+  // Replayed history is usually older than the current runtime session.
   // Keep a small grace window to avoid clock skew issues.
-  return tsMs < BOT_SESSION_STARTED_AT_MS - 60 * 1000;
+  return tsMs < BOT_SESSION_STARTED_AT_MS - STALE_MESSAGE_GRACE_MS;
 }
 
 function shouldSkipAsStaleMessage(msg, type) {
-  // Only "append" should be filtered for replayed history.
-  // "notify" is the primary signal for a new inbound user message.
-  if (type !== "append") return false;
+  if (type !== "notify" && type !== "append") return false;
   return isStaleInboundMessage(msg);
 }
 
@@ -2507,12 +2529,13 @@ async function generateReply(
     {
       role: "system",
       content: `
-את סוכנת תזונה חכמה, נעימה, מקצועית ותומכת.
+את SNAP EAT, עוזרת תזונה ומעקב ארוחות.
 עני תמיד בעברית טבעית, קצרה וברורה.
 
 הנחיות:
-- אם המשתמש/ת שואל/ת על אוכל, קלוריות, חלבון, דיאטה, שובע, נשנושים או ארוחות - תעני כמו עוזרת תזונה חכמה.
-- אם זו הודעה כללית, עדיין תעני בטבעיות ובנעימות.
+- עני רק על שאלות ישירות הקשורות למזון, תזונה, ארוחות, קלוריות, חלבון, פחמימות, שומן, מוצרים ארוזים, רכיבים, מתכונים, אלרגיות, מגבלות תזונתיות, מטרות משקל בהקשר תזונתי, ותפקוד של SNAP EAT.
+- אל תעני על נושאים לא קשורים כמו טיולים, מלונות, טיסות, תיקים, בגדים, קניות כלליות, לימודים, תכנות, טכנולוגיה, פוליטיקה, ספורט, בידור או ייעוץ לחיים כלליים.
+- אם המשתמש/ת מבקש/ה נושא לא רלוונטי, החזירי רק את התשובה המפורשת בעברית: "אני יכולה לעזור רק בנושאי מזון, תזונה ומעקב ארוחות ב-SNAP EAT. אפשר לשאול אותי על ארוחות, קלוריות, חלבון, פחמימות, שומן, מוצרים או מתכונים."
 - תני תשובות פרקטיות וקצרות יחסית.
 - אם חסר מידע, שאלי שאלה אחת קצרה.
 - השתמשי בזיכרון רק כשהוא רלוונטי לבקשה הנוכחית.
@@ -2524,7 +2547,7 @@ async function generateReply(
 - לעולם אל תחשפי למשתמש את מבנה הזיכרון הפנימי.
 - אל תתני ייעוץ רפואי.
 - לעולם אל תחשבי או תמציאי בעצמך יעד קלורי אישי או כמות חלבון אישית מדויקת - אלו מחושבים אך ורק על ידי שירות ייעודי באפליקציה. אם המשתמש/ת שואל/ת "כמה קלוריות/חלבון אני צריכה ביום", או מביע/ה רצון לרדת/לעלות/לשמור על המשקל, בקשי ממנה לשאול/לכתוב זאת כפי שהיא/הוא כתב/ה - הבקשה תטופל אוטומטית על ידי האפליקציה, ואל תנחשי מספר בעצמך.
-- לעולם אל תשאלי את המשתמש/ת על גיל, ולעולם אל תזכירי גיל 18, "מתחת לגיל 18", "מעל גיל 18", "קטין/ה" או "מבוגר/ת" בשום הקשר של חישוב תזונתי - זה לא רלוונטי לאף חלק בתהליך הזה ואסור לך להעלות את הנושא בעצמך מכל סיבה.
+- לעולם אל תשאלי את המשתמש/ת על גיל, ולעולם אל תזכירי גיל 18, "מתחת לגיל 18", "מעל גיל 18", "קטין/ה" או "מבוגר/ת" בשום הקשר של חישוי תזונתי - זה לא רלוונטי לאף חלק בתהליך הזה ואסור לך להעלות את הנושא בעצמך מכל סיבה.
 - לעולם אל תטעני או תרמזי ששמרת, עדכנת או תיעדת נתון כלשהו על המשתמש/ת (משקל, גובה, מין, רמת פעילות, מטרה, או כל פרט אישי אחר) - את/ה לא שומר/ת נתונים כאלה בעצמך בשום מקרה. עדכון נתונים כאלה מתבצע אך ורק דרך תהליך ייעודי באפליקציה, שאמור היה לתפוס הודעות כאלה לפני שהן מגיעות אלייך; אם בכל זאת הגיעה אלייך הודעה כזו, הגיבי בטבעיות בלי לטעון ששמרת משהו.
 - לעולם אל תפתחי או תמשיכי בעצמך שיחה מובנית לאיסוף פרטים לצורך חישוב יעד קלורי/חלבון (כלומר אל תשאלי ברצף על משקל, גובה, מין ורמת פעילות כדי לחשב עבור המשתמש/ת) - זהו תהליך נפרד וייעודי באפליקציה.
 
@@ -2612,9 +2635,360 @@ async function generateReplyWithNutritionKnowledge(
 // WhatsApp Bot
 // =====================
 let sock = null;
+let activeReplySocket = null;
 let isStarting = false;
 let reconnectTimer = null;
-let consecutive440Errors = 0;  // Track consecutive code 440 errors for exponential backoff
+let reconnectAttemptCount = 0;
+let botLockPath = null;
+let botLockOwned = false;
+const socketEventHandlers = new WeakMap();
+const RECONNECT_BASE_DELAY_MS = 2000;
+const RECONNECT_MAX_DELAY_MS = 10000;
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH" || error?.code === "ENOENT") {
+      return false;
+    }
+    return true;
+  }
+}
+
+function acquireBotLock() {
+  if (botLockOwned) return true;
+
+  const lockDir = path.join(__dirname, "auth_info");
+  const lockFile = path.join(lockDir, ".bot.lock");
+
+  try {
+    fs.mkdirSync(lockDir, { recursive: true });
+  } catch (error) {
+    console.log("⚠️ Failed to prepare bot lock directory:", error?.message || error);
+    return false;
+  }
+
+  while (true) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: "wx" });
+      botLockPath = lockFile;
+      botLockOwned = true;
+      return true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        console.log("⚠️ Failed to create bot lock:", error?.message || error);
+        return false;
+      }
+
+      let existingPid = null;
+      try {
+        existingPid = Number(String(fs.readFileSync(lockFile, "utf8")).trim());
+      } catch (readError) {
+        if (readError?.code === "ENOENT") {
+          continue;
+        }
+        console.log("⚠️ Failed to read bot lock:", readError?.message || readError);
+        return false;
+      }
+
+      if (!Number.isInteger(existingPid) || existingPid <= 0) {
+        try {
+          fs.rmSync(lockFile, { force: true });
+        } catch {
+          // ignore cleanup errors and retry
+        }
+        continue;
+      }
+
+      if (existingPid === process.pid) {
+        botLockPath = lockFile;
+        botLockOwned = true;
+        return true;
+      }
+
+      if (isProcessAlive(existingPid)) {
+        console.log(`🔒 Bot lock already held by PID ${existingPid}; refusing to start another instance.`);
+        return false;
+      }
+
+      try {
+        fs.rmSync(lockFile, { force: true });
+      } catch {
+        // ignore cleanup errors and retry
+      }
+    }
+  }
+}
+
+function releaseBotLock() {
+  if (!botLockOwned || !botLockPath) return;
+
+  try {
+    if (fs.existsSync(botLockPath)) {
+      const ownerPid = Number(String(fs.readFileSync(botLockPath, "utf8")).trim());
+      if (!Number.isInteger(ownerPid) || ownerPid === process.pid) {
+        fs.rmSync(botLockPath, { force: true });
+      }
+    }
+  } catch {
+    // ignore lock cleanup errors
+  }
+
+  botLockPath = null;
+  botLockOwned = false;
+}
+
+function registerSocketEventHandlers(socket, handlers) {
+  socket.ev.on("error", handlers.error);
+  socket.ev.on("creds.update", handlers.credsUpdate);
+  socket.ev.on("connection.update", handlers.connectionUpdate);
+  socket.ev.on("messages.upsert", handlers.messagesUpsert);
+  socketEventHandlers.set(socket, handlers);
+}
+
+function removeSocketEventHandlers(socket) {
+  const handlers = socketEventHandlers.get(socket);
+  if (!handlers) return;
+
+  try {
+    if (typeof socket?.ev?.off === "function") {
+      socket.ev.off("error", handlers.error);
+      socket.ev.off("creds.update", handlers.credsUpdate);
+      socket.ev.off("connection.update", handlers.connectionUpdate);
+      socket.ev.off("messages.upsert", handlers.messagesUpsert);
+    } else if (typeof socket?.ev?.removeListener === "function") {
+      socket.ev.removeListener("error", handlers.error);
+      socket.ev.removeListener("creds.update", handlers.credsUpdate);
+      socket.ev.removeListener("connection.update", handlers.connectionUpdate);
+      socket.ev.removeListener("messages.upsert", handlers.messagesUpsert);
+    }
+  } catch {
+    // ignore listener cleanup errors
+  }
+
+  socketEventHandlers.delete(socket);
+}
+
+async function disposeSocket(socket) {
+  if (!socket) return;
+
+  if (sock === socket) {
+    sock = null;
+  }
+
+  if (activeReplySocket === socket) {
+    activeReplySocket = null;
+  }
+
+  removeSocketEventHandlers(socket);
+
+  try {
+    if (socket?.ws?.close) {
+      socket.ws.close();
+    }
+  } catch (error) {
+    console.log("⚠️ Error closing existing socket:", error?.message || error);
+  }
+
+  try {
+    if (typeof socket?.end === "function") {
+      socket.end();
+    }
+  } catch {
+    // ignore socket end errors
+  }
+
+  try {
+    socket.ws = null;
+    socket.ev = null;
+  } catch {
+    // ignore reference cleanup errors
+  }
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function setActiveReplySocket(socket) {
+  activeReplySocket = socket;
+}
+
+function maskRecipient(recipient) {
+  if (!recipient) return "unknown";
+
+  const text = String(recipient);
+  if (text.length <= 4) return text;
+
+  return `${"*".repeat(text.length - 4)}${text.slice(-4)}`;
+}
+
+function inferMessageType(content) {
+  if (typeof content === "string") return "text";
+  if (!content || typeof content !== "object") return "unknown";
+
+  if (content.text !== undefined) return "text";
+  if (content.imageMessage || content.image) return "image";
+  if (content.audioMessage) return "audio";
+  if (content.videoMessage) return "video";
+  if (content.documentMessage) return "document";
+  if (content.locationMessage) return "location";
+  if (content.stickerMessage) return "sticker";
+  if (content.contactMessage) return "contact";
+
+  return "unknown";
+}
+
+function isNonEmptyContent(content) {
+  if (typeof content === "string") return content.trim().length > 0;
+  if (!content || typeof content !== "object") return false;
+  if (typeof content.text === "string") return content.text.trim().length > 0;
+  return Object.keys(content).length > 0;
+}
+
+function isSocketOpen(socket) {
+  if (!socket) return false;
+  if (typeof socket?.isConnected === "boolean") return socket.isConnected;
+  if (typeof socket?.ws?.readyState === "number") return socket.ws.readyState === 1;
+  if (socket?.ws?.readyState === "open") return true;
+  if (socket?.conn?.isConnected === true) return true;
+  return Boolean(socket?.user?.id);
+}
+
+async function sendReply({ recipient, content, eventId, reason }) {
+  if (!recipient) {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: "unknown",
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    throw new Error("sendReply requires recipient");
+  }
+
+  if (typeof reason !== "string" || !reason.trim()) {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason: "missing",
+    });
+    throw new Error("sendReply requires reason");
+  }
+
+  if (!isNonEmptyContent(content)) {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    throw new Error("sendReply requires non-empty content");
+  }
+
+  const socket = activeReplySocket || sock;
+  if (!socket) {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    throw new Error("sendReply requires active socket");
+  }
+
+  if (!isSocketOpen(socket)) {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    throw new Error("sendReply requires open connection");
+  }
+
+  if (typeof socket.sendMessage !== "function") {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    throw new Error("sendReply requires sendMessage");
+  }
+
+  try {
+    await socket.sendMessage(recipient, content);
+    console.log("📤 sendReply", {
+      status: "success",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    return true;
+  } catch (error) {
+    console.log("📤 sendReply", {
+      status: "failure",
+      recipient: maskRecipient(recipient),
+      eventId: eventId || null,
+      messageType: inferMessageType(content),
+      reason,
+    });
+    throw error;
+  }
+}
+
+function scheduleReconnect() {
+  clearReconnectTimer();
+
+  const attempt = Math.max(1, reconnectAttemptCount + 1);
+  const delayMs = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1));
+
+  reconnectAttemptCount = attempt;
+  console.log(`🔁 Reconnect scheduled in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttemptCount})`);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    console.log(`🔄 Reconnect attempt ${reconnectAttemptCount}`);
+    startBot();
+  }, delayMs);
+}
+
+function registerExitHandlers() {
+  if (process.__snapEatBotExitHandlersRegistered) return;
+
+  const handleExit = () => {
+    releaseBotLock();
+  };
+
+  process.once("exit", handleExit);
+  process.once("SIGINT", () => {
+    handleExit();
+    process.exit(130);
+  });
+  process.once("SIGTERM", () => {
+    handleExit();
+    process.exit(143);
+  });
+
+  process.__snapEatBotExitHandlersRegistered = true;
+}
+
+registerExitHandlers();
 
 /**
  * Cleanup corrupted auth_info directory
@@ -2636,33 +3010,34 @@ async function startBot() {
   isStarting = true;
 
   try {
+    if (!acquireBotLock()) {
+      isStarting = false;
+      return;
+    }
+
     if (!process.env.OPENAI_API_KEY) {
       console.log("❌ חסר OPENAI_API_KEY בקובץ .env");
       isStarting = false;
+      releaseBotLock();
       return;
     }
 
     if (!process.env.FIREBASE_STORAGE_BUCKET) {
       console.log("❌ חסר FIREBASE_STORAGE_BUCKET בקובץ .env");
       isStarting = false;
+      releaseBotLock();
       return;
     }
 
-    // Close existing socket properly
-    if (sock?.ws) {
-      try {
-        sock.ws.close();
-        sock = null;
-      } catch (err) {
-        console.log("⚠️ Error closing existing socket:", err?.message);
-      }
+    // Close and replace any existing socket safely
+    if (sock) {
+      const previousSocket = sock;
+      sock = null;
+      await disposeSocket(previousSocket);
     }
 
     // Cleanup timer
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    clearReconnectTimer();
 
     console.log("🔄 Initializing WhatsApp Bot...");
 
@@ -2688,29 +3063,11 @@ async function startBot() {
       },
     });
 
+    setActiveReplySocket(sock);
+
     console.log("📝 Setting up event listeners...");
 
-    // Suppress non-fatal decryption errors from group messages to prevent connection drops
-    sock.ev.on("error", (error) => {
-      const msg = error?.message || String(error);
-      // Ignore known group message decryption errors
-      if (
-        msg.includes("MessageCounterError") ||
-        msg.includes("Received message with old counter") ||
-        msg.includes("No session found") ||
-        msg.includes("invalid wire type")
-      ) {
-        // Silent skip - these are harmless group message decryption failures
-        return;
-      }
-      console.log("⚠️ Socket error:", msg);
-    });
-
-    // Save credentials whenever updated
-    sock.ev.on("creds.update", saveCreds);
-
-    // Handle QR code generation and connection state
-    sock.ev.on("connection.update", async (update) => {
+    const connectionUpdateHandler = async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       console.log(`📡 Connection state: ${connection}`);
@@ -2724,15 +3081,10 @@ async function startBot() {
 
       // Handle successful connection
       if (connection === "open") {
-        console.log("✅ Successfully connected to WhatsApp!");
-        consecutive440Errors = 0;  // Reset error counter on success
+        console.log("🔗 Connection opened");
+        reconnectAttemptCount = 0;
         isStarting = false;
-
-        // Clear reconnection timer
-        if (reconnectTimer) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
+        clearReconnectTimer();
       }
 
       // Handle disconnection with specific error codes
@@ -2740,77 +3092,52 @@ async function startBot() {
         const reason = lastDisconnect?.error?.output?.statusCode;
         const errorMessage = lastDisconnect?.error?.message || "Unknown error";
 
-        console.log(`\n❌ Connection closed - Code: ${reason} - ${errorMessage}`);
+        console.log("🔌 Connection closed");
 
         // 401 Unauthorized - session expired or logged out
         if (reason === 401 || reason === DisconnectReason.loggedOut) {
-          console.log("🔐 Re-authentication required (401 Unauthorized)");
+          console.log("🔐 Authentication failed; not reconnecting");
           console.log("🧹 Cleaning up corrupted session...");
           cleanAuthDirectory();
           console.log("↻ Restart the bot to scan new QR code");
           isStarting = false;
+          clearReconnectTimer();
           return;
         }
 
         // 403 Forbidden - generally means connection replaced
         if (reason === 403) {
-          console.log("⚠️ Session replaced (403)");
-          console.log("This may happen if you connected on another device");
+          console.log("⚠️ Session replaced; not reconnecting");
+          console.log("🧹 Cleaning up corrupted session...");
           cleanAuthDirectory();
           isStarting = false;
+          clearReconnectTimer();
           return;
         }
 
         // 405 Not Allowed - typically device pairing issue
         if (reason === 405) {
-          console.log("⚠️ Device pairing issue (405)");
+          console.log("⚠️ Device pairing issue; not reconnecting");
+          console.log("🧹 Cleaning up corrupted session...");
           cleanAuthDirectory();
           isStarting = false;
+          clearReconnectTimer();
           return;
         }
 
-        // 515 Restart Required
-        if (reason === 515 || reason === DisconnectReason.restartRequired) {
-          console.log("🔄 Restart required (515) - reconnecting in 2 seconds...");
+        // 515 Restart Required or other recoverable disconnects
+        if (reason === 515 || reason === DisconnectReason.restartRequired || reason === 440 || !reason) {
           isStarting = false;
-          if (!reconnectTimer) {
-            reconnectTimer = setTimeout(() => {
-              reconnectTimer = null;
-              startBot();
-            }, 2000);
-          }
+          scheduleReconnect();
           return;
         }
 
-        // Handle connection conflicts from group chats
-        if (reason === 440) {
-          consecutive440Errors++;
-          const backoffMs = Math.min(10000, 3000 * Math.pow(1.5, consecutive440Errors - 1));
-          console.log(`⚠️ Connection conflict (440) - attempt ${consecutive440Errors}`);
-          console.log(`🔄 Reconnecting in ${Math.round(backoffMs / 1000)}s (exponential backoff)...`);
-          isStarting = false;
-          if (!reconnectTimer) {
-            reconnectTimer = setTimeout(() => {
-              reconnectTimer = null;
-              startBot();
-            }, backoffMs);
-          }
-          return;
-        }
-
-        // Generic reconnection for other errors
-        console.log("🔄 Reconnecting in 3 seconds...");
         isStarting = false;
-        if (!reconnectTimer) {
-          reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            startBot();
-          }, 3000);
-        }
+        scheduleReconnect();
       }
-    });
+    };
 
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    const messagesUpsertHandler = async ({ messages, type }) => {
       const msg = messages?.[0];
 
       if (!msg) {
@@ -2824,12 +3151,12 @@ async function startBot() {
       }
 
       if (hasProcessedMessage(msg)) {
-        console.log("⏭️  Skip: Duplicate upsert for message id=%s", msg?.key?.id || "[missing]");
+        console.log("⏭️ Duplicate message skipped");
         return;
       }
 
       if (shouldSkipAsStaleMessage(msg, type)) {
-        console.log("⏭️  Skip: Stale/replayed message id=%s", msg?.key?.id || "[missing]");
+        console.log("⏭️ Stale message skipped");
         return;
       }
 
@@ -2846,7 +3173,7 @@ async function startBot() {
   ALLOWED_NUMBERS.size > 0 &&
   !ALLOWED_NUMBERS.has(resolvedPhone)
 ) {
-  console.log(`SKIP: phone not allowed (${resolvedPhone})`);
+  console.log("⏭️ Message skipped: phone not allowed");
   return;
 }
 
@@ -2869,7 +3196,7 @@ async function startBot() {
         imageMessage?.caption ||
         "";
 
-      console.log("✅ Accepted: type=%s text=%s", type, text ? `"${text.substring(0, 40)}..."` : "[no text]");
+      console.log("✅ Message accepted");
 
       try {
 
@@ -2944,14 +3271,14 @@ async function startBot() {
           if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.BARCODE_GUIDANCE) {
             pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
             addToHistory(resolvedPhone, "user", text ? `[תמונת ברקוד] ${text}` : "[תמונת ברקוד]");
-            await sock.sendMessage(from, { text: BARCODE_READ_FAILED_HEBREW });
+            await sendReply({ recipient: from, content: { text: BARCODE_READ_FAILED_HEBREW }, reason: "barcode_read_failed", eventId: msg?.key?.id || null });
             return;
           }
 
           if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.REQUEST_BARCODE) {
             pending.set(from, { step: "awaiting_product_barcode", createdAt: Date.now() });
             addToHistory(resolvedPhone, "user", text ? `[תמונת מוצר ארוז] ${text}` : "[תמונת מוצר ארוז]");
-            await sock.sendMessage(from, { text: PACKAGED_PRODUCT_DETECTED_HEBREW });
+            await sendReply({ recipient: from, content: { text: PACKAGED_PRODUCT_DETECTED_HEBREW }, reason: "packaged_product_detected", eventId: msg?.key?.id || null });
             return;
           }
 
@@ -2959,13 +3286,13 @@ async function startBot() {
             // No meal is estimated, no pending meal state is created, and
             // Open Food Facts is never called for a non-food image.
             addToHistory(resolvedPhone, "user", text ? `[תמונה שאינה מזון] ${text}` : "[תמונה שאינה מזון]");
-            await sock.sendMessage(from, { text: NON_FOOD_IMAGE_HEBREW });
+            await sendReply({ recipient: from, content: { text: NON_FOOD_IMAGE_HEBREW }, reason: "non_food_image", eventId: msg?.key?.id || null });
             return;
           }
 
           if (imageBarcodeRoute === IMAGE_BARCODE_ROUTES.LOW_CONFIDENCE_FOOD) {
             addToHistory(resolvedPhone, "user", text ? `[תמונה לא ברורה] ${text}` : "[תמונה לא ברורה]");
-            await sock.sendMessage(from, { text: LOW_CONFIDENCE_FOOD_IMAGE_HEBREW });
+            await sendReply({ recipient: from, content: { text: LOW_CONFIDENCE_FOOD_IMAGE_HEBREW }, reason: "low_confidence_food_image", eventId: msg?.key?.id || null });
             return;
           }
 
@@ -2974,9 +3301,7 @@ async function startBot() {
             confidence: null,
           });
 
-          await sock.sendMessage(from, {
-            text: "מנתחת את התמונה עכשיו, רגע 🙏",
-          });
+          await sendReply({ recipient: from, content: { text: "מנתחת את התמונה עכשיו, רגע 🙏" }, reason: "image_analysis_started", eventId: msg?.key?.id || null });
 
           const mime = imageMessage.mimetype || "image/jpeg";
           const base64 = buffer.toString("base64");
@@ -3013,23 +3338,19 @@ async function startBot() {
           });
 
           if (shouldClarify && clarificationQuestion) {
-            await sock.sendMessage(from, {
-              text: `${analysisText}
+            await sendReply({ recipient: from, content: { text: `${analysisText}
 
 כדי לדייק יותר:
-${clarificationQuestion}`,
-            });
+${clarificationQuestion}` }, reason: "meal_analysis_clarification", eventId: msg?.key?.id || null });
           } else {
-            await sock.sendMessage(from, {
-              text: `${analysisText}
+            await sendReply({ recipient: from, content: { text: `${analysisText}
 
 איזו ארוחה זו הייתה?
 כתבי רק אחת מהאפשרויות:
 בוקר
 צהריים
 ערב
-ביניים`,
-            });
+ביניים` }, reason: "meal_type_prompt", eventId: msg?.key?.id || null });
           }
 
           addToHistory(resolvedPhone, "assistant", analysisText);
@@ -3092,16 +3413,14 @@ ${clarificationQuestion}`,
               mealNote: p.mealNote,
             });
 
-            await sock.sendMessage(from, {
-              text: `${refinedAnalysisText}
+            await sendReply({ recipient: from, content: { text: `${refinedAnalysisText}
 
 איזו ארוחה זו הייתה?
 כתבי רק אחת מהאפשרויות:
 בוקר
 צהריים
 ערב
-ביניים`,
-            });
+ביניים` }, reason: "meal_type_prompt", eventId: msg?.key?.id || null });
 
             return;
           }
@@ -3110,15 +3429,11 @@ ${clarificationQuestion}`,
             const mealType = normalizeMealType(cleanText);
 
             if (!mealType) {
-              await sock.sendMessage(from, {
-                text: "לא הבנתי את סוג הארוחה.\nכתבי רק:\nבוקר\nצהריים\nערב\nביניים",
-              });
+              await sendReply({ recipient: from, content: { text: "לא הבנתי את סוג הארוחה.\nכתבי רק:\nבוקר\nצהריים\nערב\nביניים" }, reason: "meal_type_unknown", eventId: msg?.key?.id || null });
               return;
             }
 
-            console.log("WhatsApp destination:", from);
-            console.log("Resolved real phone:", resolvedPhone);
-            console.log("Saving meal for phone:", resolvedPhone);
+            console.log("📦 Saving meal entry");
 
             const saved = await saveMealEntry({
               phone: resolvedPhone,
@@ -3130,11 +3445,9 @@ ${clarificationQuestion}`,
 
             pending.delete(from);
 
-            await sock.sendMessage(from, {
-              text: saved
+            await sendReply({ recipient: from, content: { text: saved
                 ? "✅ נשמר בהצלחה ליומן באתר"
-                : "לא מצאתי משתמש באתר עם מספר הטלפון הזה. תוודאי שבאתר נשמר אותו מספר טלפון בדיוק.",
-            });
+                : "לא מצאתי משתמש באתר עם מספר הטלפון הזה. תוודאי שבאתר נשמר אותו מספר טלפון בדיוק." }, reason: "meal_saved", eventId: msg?.key?.id || null });
 
             return;
           }
@@ -3161,6 +3474,23 @@ ${clarificationQuestion}`,
             if (handledAsStandaloneProfileUpdate) return;
           }
 
+          const pendingState = pending.get(from) || null;
+          if (!pendingState && isGreetingMessage(cleanText)) {
+            addToHistory(resolvedPhone, "user", cleanText);
+            const reply = getGreetingReply();
+            await sendReply({ recipient: from, content: { text: reply }, reason: "greeting_reply", eventId: msg?.key?.id || null });
+            addToHistory(resolvedPhone, "assistant", reply);
+            return;
+          }
+
+          if (!isNutritionRelatedMessage(cleanText, pendingState)) {
+            addToHistory(resolvedPhone, "user", cleanText);
+            const reply = getOutOfScopeReply();
+            await sendReply({ recipient: from, content: { text: reply }, reason: "scope_guard_rejected", eventId: msg?.key?.id || null });
+            addToHistory(resolvedPhone, "assistant", reply);
+            return;
+          }
+
           addToHistory(resolvedPhone, "user", cleanText);
 
           const memoryService = await getMemoryService();
@@ -3185,7 +3515,7 @@ ${clarificationQuestion}`,
           });
           const reply = replyData?.reply || replyData;
 
-          await sock.sendMessage(from, { text: reply });
+          await sendReply({ recipient: from, content: { text: reply }, reason: "assistant_reply", eventId: msg?.key?.id || null });
 
           addToHistory(resolvedPhone, "assistant", reply);
 
@@ -3236,9 +3566,7 @@ ${clarificationQuestion}`,
         console.log("❌ Error in messages.upsert:", err?.message || err);
 
         try {
-          await sock.sendMessage(from, {
-            text: "הייתה לי תקלה קטנה, נסי שוב עוד רגע 🙏",
-          });
+          await sendReply({ recipient: from, content: { text: "הייתה לי תקלה קטנה, נסי שוב עוד רגע 🙏" }, reason: "error_fallback", eventId: msg?.key?.id || null });
         } catch (sendErr) {
           console.log(
             "❌ failed sending error message:",
@@ -3246,20 +3574,44 @@ ${clarificationQuestion}`,
           );
         }
       }
+    };
+
+    const errorHandler = (error) => {
+      const msg = error?.message || String(error);
+      // Ignore known group message decryption errors
+      if (
+        msg.includes("MessageCounterError") ||
+        msg.includes("Received message with old counter") ||
+        msg.includes("No session found") ||
+        msg.includes("invalid wire type")
+      ) {
+        // Silent skip - these are harmless group message decryption failures
+        return;
+      }
+      console.log("⚠️ Socket error:", msg);
+    };
+
+    registerSocketEventHandlers(sock, {
+      error: errorHandler,
+      credsUpdate: saveCreds,
+      connectionUpdate: connectionUpdateHandler,
+      messagesUpsert: messagesUpsertHandler,
     });
   } catch (err) {
     console.log("❌ ❌ Fatal error initializing bot:", err?.message || err);
     console.log("Stack trace:", err?.stack);
     isStarting = false;
+    releaseBotLock();
 
     // Retry after delay
-    console.log("🔄 Retrying in 5 seconds...");
-    if (!reconnectTimer) {
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        startBot();
-      }, 5000);
-    }
+    console.log("� Reconnect scheduled in 5s (attempt 1)");
+    reconnectAttemptCount = 1;
+    clearReconnectTimer();
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      console.log("🔄 Reconnect attempt 1");
+      startBot();
+    }, 5000);
   }
 }
 

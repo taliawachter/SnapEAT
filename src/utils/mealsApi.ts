@@ -109,6 +109,28 @@ export async function updateDiaryMeal(mealId: string, payload: Record<string, un
   return response.json();
 }
 
+export async function deleteDiaryMeal(mealId: string) {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error("צריך להתחבר כדי למחוק ארוחה.");
+  }
+
+  const idToken = await user.getIdToken();
+  const response = await fetch(`${API_BASE_URL}/api/diary/meals/${encodeURIComponent(mealId)}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    const errorPayload = await parseErrorPayload(response);
+    throw buildApiRequestError(errorPayload.message, response.status, errorPayload.code);
+  }
+
+  return response.json();
+}
+
 export function toAbsoluteUploadUrl(imageUrl: string) {
   if (!imageUrl) return "";
   if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) return imageUrl;

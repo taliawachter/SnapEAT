@@ -3,10 +3,10 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { collection, getDocs, orderBy, query } from "firebase/firestore/lite";
 import { onAuthStateChanged } from "firebase/auth";
 import type { FirebaseError } from "firebase/app";
-import { ChevronRight, Heart, Pencil } from "lucide-react";
+import { ChevronRight, Heart, Pencil, Trash2 } from "lucide-react";
 import { auth, db } from "../firebase.js";
 import { addFavorite, isMealFavorited } from "../utils/favoritesApi.js";
-import { updateDiaryMeal } from "../utils/mealsApi.js";
+import { deleteDiaryMeal, updateDiaryMeal } from "../utils/mealsApi.js";
 import {
   formatEstimatedNumericDisplay,
   formatEstimatedQuantityDisplay,
@@ -150,6 +150,8 @@ function MealCardShell({
   isSavingFavorite,
   onEditClick,
   onFavoriteClick,
+  onDeleteClick,
+  isDeleting = false,
   expanded = false,
 }: {
   title: string;
@@ -159,6 +161,8 @@ function MealCardShell({
   isSavingFavorite: boolean;
   onEditClick: () => void;
   onFavoriteClick: () => void;
+  onDeleteClick: () => void;
+  isDeleting?: boolean;
   expanded?: boolean;
 }) {
   return (
@@ -187,6 +191,17 @@ function MealCardShell({
                 isFavorited ? "fill-orange text-orange" : ""
               }`}
             />
+          </button>
+          <button
+            type="button"
+            aria-label="מחיקת ארוחה"
+            disabled={isDeleting}
+            onClick={(event) => {
+              event.stopPropagation();
+              onDeleteClick();
+            }}
+          >
+            <Trash2 className={`h-8 w-8 transition ${isDeleting ? "opacity-60" : ""}`} />
           </button>
         </div>
 
@@ -825,6 +840,9 @@ export default function MealCategoryScreen() {
   const [mealEditSaveError, setMealEditSaveError] = useState<string | null>(null);
   const [mealEditSuccessMessage, setMealEditSuccessMessage] = useState<string | null>(null);
   const [isSavingMealEdit, setIsSavingMealEdit] = useState(false);
+  const [pendingDeleteMeal, setPendingDeleteMeal] = useState<MealEntry | null>(null);
+  const [isDeletingMeal, setIsDeletingMeal] = useState(false);
+  const [deleteErrorMessage, setDeleteErrorMessage] = useState<string | null>(null);
 
   const selectedDate = useMemo(() => {
     return parseDateKey(searchParams.get("date"));
@@ -1074,6 +1092,33 @@ export default function MealCategoryScreen() {
     }
   }, [closeMealEditModal, editingMealId, mealEditDraft, mealType, selectedDate]);
 
+  const handleDeleteMeal = useCallback(async (meal: MealEntry) => {
+    if (!meal?.id) return;
+
+    const mealId = meal.id;
+    const previousEntries = entries;
+    setDeleteErrorMessage(null);
+    setIsDeletingMeal(true);
+
+    setEntries((previous) => previous.filter((current) => current.id !== mealId));
+    setFavoriteStateByMealId((previous) => {
+      const next = { ...previous };
+      delete next[mealId];
+      return next;
+    });
+    setPendingDeleteMeal(null);
+
+    try {
+      await deleteDiaryMeal(mealId);
+    } catch (error) {
+      console.error("Failed to delete meal:", error);
+      setEntries(previousEntries);
+      setDeleteErrorMessage("מחיקת הארוחה נכשלה. נסי שוב.");
+    } finally {
+      setIsDeletingMeal(false);
+    }
+  }, [entries]);
+
   const mealEditMismatchWarning = useMemo(() => {
     if (!mealEditDraft) return null;
     return getMacroMismatchWarning(mealEditDraft);
@@ -1113,6 +1158,12 @@ export default function MealCategoryScreen() {
           </div>
         )}
 
+        {deleteErrorMessage && (
+          <div className="mx-4 mt-3 rounded-2xl bg-red-500 px-4 py-3 text-center text-sm font-semibold text-white">
+            {deleteErrorMessage}
+          </div>
+        )}
+
         <div className="px-4 py-8">
           <AddMealButton onClick={() => navigate("/my-meals", { state: { preselectedMealType: mealType } })} />
 
@@ -1147,6 +1198,11 @@ export default function MealCategoryScreen() {
                       isFavorited={isFavorited}
                       isSavingFavorite={isSavingFavorite}
                       onEditClick={() => openMealEditModal(meal, title)}
+                      onDeleteClick={() => {
+                        setPendingDeleteMeal(meal);
+                        setDeleteErrorMessage(null);
+                      }}
+                      isDeleting={isDeletingMeal && pendingDeleteMeal?.id === meal.id}
                       onFavoriteClick={() => {
                         const userId = auth.currentUser?.uid;
                         if (!userId || isFavorited || isSavingFavorite) return;
@@ -1199,6 +1255,54 @@ export default function MealCategoryScreen() {
           </div>
         )}
       </div>
+
+      {pendingDeleteMeal && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 px-4 pb-6"
+          onClick={() => {
+            setPendingDeleteMeal(null);
+            setDeleteErrorMessage(null);
+          }}
+        >
+          <div
+            className="w-full max-w-150 rounded-3xl bg-cream p-5 shadow-2xl"
+            dir="rtl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 className="text-xl font-bold text-orange">מחיקת ארוחה</h2>
+            <p className="mt-3 text-base text-dark">Are you sure you want to delete this meal?</p>
+
+            {deleteErrorMessage && (
+              <p className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+                {deleteErrorMessage}
+              </p>
+            )}
+
+            <div className="mt-5 flex gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingDeleteMeal(null);
+                  setDeleteErrorMessage(null);
+                }}
+                className="flex-1 rounded-full border border-orange py-3 font-bold text-orange"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void handleDeleteMeal(pendingDeleteMeal);
+                }}
+                disabled={isDeletingMeal}
+                className="flex-1 rounded-full bg-orange py-3 font-bold text-white shadow-md disabled:opacity-60"
+              >
+                {isDeletingMeal ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {editingMealId && mealEditDraft && (
         <MealEditModal
