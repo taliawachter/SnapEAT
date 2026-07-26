@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { getNutritionKnowledgeAnswer } from "../services/nutrition-knowledge.service.js";
+import { getNutritionKnowledgeAnswer, shouldDelegateToDefaultNutritionAssistant } from "../services/nutrition-knowledge.service.js";
 
 const SAFE_FALLBACK_HEBREW = "כרגע לא הצלחתי לגשת למקורות המידע המאומתים, ולכן אני לא רוצה לתת תשובה שעלולה להיות לא מדויקת. אפשר לנסות שוב מאוחר יותר, ובשאלה רפואית או אישית מומלץ לפנות לאיש מקצוע מוסמך.";
 const VERIFIED_INFO_UNAVAILABLE_HEBREW = "אין לי כרגע מספיק מידע מאומת במאגר כדי לענות על החלק הזה במדויק.";
@@ -33,6 +33,13 @@ function buildMockClient(responseFactory) {
     },
   };
 }
+
+test("delegates to the regular assistant when RAG has no usable answer", () => {
+  assert.equal(shouldDelegateToDefaultNutritionAssistant({ usedFallback: true, answer: VERIFIED_INFO_UNAVAILABLE_HEBREW }), true);
+  assert.equal(shouldDelegateToDefaultNutritionAssistant({ errorCode: "NO_VERIFIED_CITATIONS", answer: VERIFIED_INFO_UNAVAILABLE_HEBREW }), true);
+  assert.equal(shouldDelegateToDefaultNutritionAssistant({ answer: "", usedFallback: false }), true);
+  assert.equal(shouldDelegateToDefaultNutritionAssistant({ answer: "תשובה מאומתת", usedFallback: false, errorCode: null }), false);
+});
 
 test("blank question returns default-flow signal", async () => {
   const client = buildMockClient({ id: "resp_unused", output_text: "ignored" });

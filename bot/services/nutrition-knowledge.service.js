@@ -197,6 +197,15 @@ function buildNutritionInput({ question, userProfileSummary, memorySummary, meal
   ];
 }
 
+export function shouldDelegateToDefaultNutritionAssistant(nutritionResult = {}) {
+  if (!nutritionResult || typeof nutritionResult !== "object") return true;
+  if (nutritionResult.shouldUseDefaultFlow) return true;
+  if (!nutritionResult.answer) return true;
+  if (nutritionResult.usedFallback) return true;
+  if (nutritionResult.errorCode) return true;
+  return false;
+}
+
 export async function getNutritionKnowledgeAnswer({
   question,
   userProfileSummary = "",

@@ -733,6 +733,20 @@ export function parseProfileAnswerText(rawText = "") {
   return parseNutritionProfileFields(rawText).fields;
 }
 
+export function shouldHandleStandaloneProfileUpdate(rawText = "", parsedProfile = {}) {
+  const { fields = {}, invalidFields = {} } = parsedProfile || {};
+  const text = String(rawText || "").trim();
+  if (!text) return false;
+
+  const lower = text.toLowerCase();
+  const looksLikeQuestion = /\?$/.test(text) || /^(מה|כמה|איך|איפה|מתי|למה|האם|אפשר|תן|תני|כיצד|מי)/.test(lower);
+  if (looksLikeQuestion) return false;
+
+  const parsedProfileFields = Object.keys(fields).concat(Object.keys(invalidFields));
+  const profileFieldSet = new Set(["weightKg", "heightCm", "age", "sex", "activityLevel", "goal"]);
+  return parsedProfileFields.some((field) => profileFieldSet.has(field));
+}
+
 /**
  * Interprets a single bare answer (e.g. just "28", "170", or "בינונית") in
  * the context of the ONE field the bot most recently asked about — used

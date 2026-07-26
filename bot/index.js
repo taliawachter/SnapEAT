@@ -39,7 +39,7 @@ import {
   validateMealEditDraft,
 } from "../shared/meal-edit.js";
 import { isGeneralNutritionQuestion } from "./services/nutrition-routing.helper.js";
-import { getNutritionKnowledgeAnswer } from "./services/nutrition-knowledge.service.js";
+import { getNutritionKnowledgeAnswer, shouldDelegateToDefaultNutritionAssistant } from "./services/nutrition-knowledge.service.js";
 import { detectNutritionTargetRequest } from "./services/nutrition-targets-routing.helper.js";
 import {
   getNutritionTarget,
@@ -55,6 +55,7 @@ import {
   normalizeActivityLevel,
   normalizeGoal,
   mergeNutritionProfile,
+  shouldHandleStandaloneProfileUpdate,
   ACTIVITY_LEVEL_SHORT_LABEL_HEBREW,
   REQUIRED_CALORIE_FIELDS,
   REQUIRED_PROTEIN_FIELDS,
@@ -87,8 +88,9 @@ import {
   classifyFoodImage,
   FOOD_IMAGE_MIN_CONFIDENCE,
 } from "./services/packaged-product-image.service.js";
-import { getOutOfScopeReply, isGreetingMessage, isNutritionRelatedMessage } from "./services/scope-guard.service.js";
+import { getOutOfScopeReply, isGreetingMessage, isNutritionRelatedMessage, debugNutritionScopeDecision } from "./services/scope-guard.service.js";
 import { getGreetingResponseForUser } from "./services/greeting-welcome.service.js";
+import { getCourtesyResponseForUser } from "./services/courtesy-closing.service.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2056,7 +2058,7 @@ const PROFILE_FIELD_CONFIRMATION_LABEL_HEBREW = {
 
 async function handleStandaloneProfileUpdate({ sock, from, resolvedPhone, cleanText, messageId }) {
   const { fields, invalidFields } = parseNutritionProfileFields(cleanText);
-  if (!isStandaloneProfileUpdateMessage(fields, invalidFields)) return false;
+  if (!shouldHandleStandaloneProfileUpdate(cleanText, { fields, invalidFields })) return false;
 
   const hasFieldsToSave = Object.keys(fields).length > 0;
   const saveResult = hasFieldsToSave
@@ -2540,12 +2542,26 @@ async function generateReply(
   userText,
   { currentMessageId = "", currentMessageTimestampMs = null, memoryContextOverride = null } = {}
 ) {
+  console.log("ASSISTANT GENERATION FUNCTION CALLED", { function: "generateReply", chatId });
+
   const memoryContext = memoryContextOverride || await buildMemoryContext(chatId, {
     currentUserMessage: userText,
     currentMessageId,
     currentMessageTimestampMs,
   });
 
+  // Every caller of generateReply() has already had its message confirmed
+  // in-scope by the deterministic isNutritionRelatedMessage() guard before
+  // this function is ever invoked (see messagesUpsertHandler, which returns
+  // the scope-guard's own out-of-scope reply and never calls
+  // generateReplyWithNutritionKnowledge/generateReply otherwise). This
+  // system prompt therefore intentionally does NOT ask the model to
+  // re-judge topic relevance or to self-issue the scope-guard's rejection
+  // sentence: giving the model that literal sentence as an instruction
+  // previously let it emit it non-deterministically for boundary-y but
+  // in-scope questions (e.g. "מה אני צריכה לאכול בשביל לרדת במשקל"),
+  // silently contradicting the guard's decision downstream.
+  const promptTemplate = "default_assistant_prompt_v2_no_self_scope_check";
   const messages = [
     {
       role: "system",
@@ -2554,9 +2570,6 @@ async function generateReply(
 עני תמיד בעברית טבעית, קצרה וברורה.
 
 הנחיות:
-- עני רק על שאלות ישירות הקשורות למזון, תזונה, ארוחות, קלוריות, חלבון, פחמימות, שומן, מוצרים ארוזים, רכיבים, מתכונים, אלרגיות, מגבלות תזונתיות, מטרות משקל בהקשר תזונתי, ותפקוד של SNAP EAT.
-- אל תעני על נושאים לא קשורים כמו טיולים, מלונות, טיסות, תיקים, בגדים, קניות כלליות, לימודים, תכנות, טכנולוגיה, פוליטיקה, ספורט, בידור או ייעוץ לחיים כלליים.
-- אם המשתמש/ת מבקש/ה נושא לא רלוונטי, החזירי רק את התשובה המפורשת בעברית: "אני יכולה לעזור רק בנושאי מזון, תזונה ומעקב ארוחות ב-SNAP EAT. אפשר לשאול אותי על ארוחות, קלוריות, חלבון, פחמימות, שומן, מוצרים או מתכונים."
 - תני תשובות פרקטיות וקצרות יחסית.
 - אם חסר מידע, שאלי שאלה אחת קצרה.
 - השתמשי בזיכרון רק כשהוא רלוונטי לבקשה הנוכחית.
@@ -2596,6 +2609,8 @@ ${String(userText || "").trim()}
     },
   ];
 
+  console.log("ASSISTANT PROMPT TEMPLATE SELECTED", { function: "generateReply", promptTemplate });
+
   const resp = await client.chat.completions.create({
     model: "gpt-4o-mini",
     messages,
@@ -2603,18 +2618,30 @@ ${String(userText || "").trim()}
   });
 
   const rawContent = resp.choices?.[0]?.message?.content?.trim() || "";
+  console.log("ASSISTANT RAW MODEL RESPONSE", { function: "generateReply", rawContent });
+
   const parsed = parseAssistantJson(rawContent);
 
   if (!parsed || typeof parsed !== "object") {
-    return {
-      reply: rawContent || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
-    };
+    const fallbackReply = rawContent || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏";
+    console.log("ASSISTANT FINAL REPLY", {
+      function: "generateReply",
+      usedHardcodedFallback: !rawContent,
+      finalReply: fallbackReply,
+    });
+    return { reply: fallbackReply };
   }
 
   const reply = String(parsed.reply || "").trim();
+  const finalReply = reply || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏";
+  console.log("ASSISTANT FINAL REPLY", {
+    function: "generateReply",
+    usedHardcodedFallback: !reply,
+    finalReply,
+  });
 
   return {
-    reply: reply || "תכתבי לי שוב ואנסה לעזור בצורה יותר מדויקת 🙏",
+    reply: finalReply,
   };
 }
 
@@ -2623,6 +2650,12 @@ async function generateReplyWithNutritionKnowledge(
   userText,
   { currentMessageId = "", currentMessageTimestampMs = null } = {}
 ) {
+  console.log("ASSISTANT GENERATION FUNCTION CALLED", {
+    function: "generateReplyWithNutritionKnowledge",
+    chatId,
+    isGeneralNutritionQuestion: isGeneralNutritionQuestion(userText),
+  });
+
   const memoryContext = await buildMemoryContext(chatId, {
     currentUserMessage: userText,
     currentMessageId,
@@ -2640,7 +2673,22 @@ async function generateReplyWithNutritionKnowledge(
       model: process.env.OPENAI_MODEL,
     });
 
-    if (!nutritionResult.shouldUseDefaultFlow && nutritionResult.answer) {
+    const willDelegateToDefaultAssistant = shouldDelegateToDefaultNutritionAssistant(nutritionResult);
+    console.log("ASSISTANT RAW MODEL RESPONSE", {
+      function: "getNutritionKnowledgeAnswer",
+      usedFallback: nutritionResult.usedFallback,
+      errorCode: nutritionResult.errorCode,
+      shouldUseDefaultFlow: nutritionResult.shouldUseDefaultFlow,
+      rawAnswer: nutritionResult.answer,
+      willDelegateToDefaultAssistant,
+    });
+
+    if (!willDelegateToDefaultAssistant && nutritionResult.answer) {
+      console.log("ASSISTANT FINAL REPLY", {
+        function: "generateReplyWithNutritionKnowledge",
+        usedHardcodedFallback: nutritionResult.usedFallback,
+        finalReply: nutritionResult.answer,
+      });
       return { reply: nutritionResult.answer };
     }
   }
@@ -3514,7 +3562,27 @@ ${clarificationQuestion}` }, reason: "meal_analysis_clarification", eventId: msg
             return;
           }
 
-          if (!isNutritionRelatedMessage(cleanText, pendingState)) {
+          const courtesyResult = getCourtesyResponseForUser({ text: cleanText, pendingState });
+
+          if (courtesyResult.shouldReply) {
+            addToHistory(resolvedPhone, "user", cleanText);
+            const reply = courtesyResult.reply;
+            await sendReply({ recipient: from, content: { text: reply }, reason: "courtesy_reply", eventId: msg?.key?.id || null });
+            addToHistory(resolvedPhone, "assistant", reply);
+            return;
+          }
+
+          console.log("SCOPE GUARD CHECK", {
+            text,
+            cleanText,
+            pendingState,
+            decision: debugNutritionScopeDecision(cleanText, pendingState),
+          });
+
+          const isInScope = isNutritionRelatedMessage(cleanText, pendingState);
+          console.log(isInScope ? "SCOPE ACCEPTED" : "SCOPE REJECTED");
+
+          if (!isInScope) {
             addToHistory(resolvedPhone, "user", cleanText);
             const reply = getOutOfScopeReply();
             await sendReply({ recipient: from, content: { text: reply }, reason: "scope_guard_rejected", eventId: msg?.key?.id || null });
@@ -3663,4 +3731,6 @@ export {
   handleStandaloneProfileUpdate,
   getStoredNutritionProfileLayers,
   saveTargetProfileFields,
+  generateReply,
+  generateReplyWithNutritionKnowledge,
 };
